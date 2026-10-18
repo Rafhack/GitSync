@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
-use gitsync::config::Config;
+use gitsync::apply::{sync_peer, Plan};
+use gitsync::config::{Config, Peer};
 use gitsync::fetch::fetch_peer;
 use gitsync::git::Git;
 use gitsync::snapshot::{self, Outcome};
@@ -50,6 +51,12 @@ enum Command {
         /// Only this peer (its `name` in the config).
         peer: Option<String>,
     },
+    /// Apply what was fetched, when safe: the peer's snapshot to your files,
+    /// and fast-forwards of branches that are behind.
+    Apply {
+        /// Only this peer (its `name` in the config).
+        peer: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -88,6 +95,7 @@ fn main() -> Result<()> {
         },
         Command::Watch { .. } => watch::watch(&git, &machine_id, &config)?,
         Command::Fetch { peer } => fetch(&git, &config, peer.as_deref())?,
+        Command::Apply { peer } => apply(&git, &machine_id, &config, peer.as_deref())?,
         Command::Status => print!("{}", Status::collect(&git, &machine_id, config)?),
     }
     Ok(())
@@ -96,18 +104,7 @@ fn main() -> Result<()> {
 /// `gitsync fetch`: fetch every configured peer (or one), print what changed.
 /// Keeps going if one peer fails, but exits with an error at the end.
 fn fetch(git: &Git, config: &Config, only: Option<&str>) -> Result<()> {
-    let peers: Vec<_> = config
-        .peers
-        .iter()
-        .filter(|peer| only.is_none_or(|name| peer.name == name))
-        .collect();
-    if peers.is_empty() {
-        match only {
-            Some(name) => bail!("no peer named {name:?} in the config"),
-            None => bail!("no peers in the config; add [[peers]] to .git/gitsync.toml"),
-        }
-    }
-
+    let peers = select_peers(config, only)?;
     let mut failed = 0;
     for peer in peers {
         match fetch_peer(git, peer) {
@@ -140,4 +137,46 @@ fn fetch(git: &Git, config: &Config, only: Option<&str>) -> Result<()> {
         bail!("{failed} peer(s) could not be fetched");
     }
     Ok(())
+}
+
+/// `gitsync apply`: apply what was already fetched, peer by peer.
+fn apply(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Result<()> {
+    for peer in select_peers(config, only)? {
+        let report = sync_peer(git, machine_id, &peer.name)?;
+        match &report.plan {
+            Some(Plan::Apply { .. }) => {
+                println!("{}: applied", peer.name);
+                for file in &report.applied_files {
+                    println!("  {file}");
+                }
+            }
+            Some(plan) => println!("{}: {plan}", peer.name),
+            None => {}
+        }
+        for (branch, old, new) in &report.branches {
+            println!(
+                "{}: fast-forwarded {branch} {}..{}",
+                peer.name,
+                &old[..12],
+                &new[..12]
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The configured peers, or just the one named `only`.
+fn select_peers<'a>(config: &'a Config, only: Option<&str>) -> Result<Vec<&'a Peer>> {
+    let peers: Vec<_> = config
+        .peers
+        .iter()
+        .filter(|peer| only.is_none_or(|name| peer.name == name))
+        .collect();
+    if peers.is_empty() {
+        match only {
+            Some(name) => bail!("no peer named {name:?} in the config"),
+            None => bail!("no peers in the config; add [[peers]] to .git/gitsync.toml"),
+        }
+    }
+    Ok(peers)
 }

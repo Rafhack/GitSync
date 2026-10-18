@@ -1,5 +1,6 @@
 //! gitsync: keeps a git repository in sync across machines. See DESIGN.md.
 
+pub mod apply;
 pub mod config;
 pub mod fetch;
 pub mod git;
