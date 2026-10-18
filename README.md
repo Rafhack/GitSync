@@ -24,6 +24,7 @@ Syncing to other machines is the next step (DESIGN.md, section 9).
 ## Code map
 
 - `src/main.rs`: command line (`snapshot`, `watch`).
+- `src/lib.rs`: lists the modules below (so tests can use them).
 - `src/git.rs`: small wrapper that runs the `git` program.
 - `src/snapshot.rs`: turns uncommitted work into a snapshot commit.
 - `src/watch.rs`: file watcher + polling loop.
