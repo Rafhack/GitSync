@@ -32,12 +32,7 @@ impl Git {
     pub fn run_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String> {
         let output = self.output(args, envs)?;
         if !output.status.success() {
-            bail!(
-                "`git {}` failed ({}): {}",
-                args.join(" "),
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            bail!(failure(args, &output));
         }
         Ok(stdout(&output))
     }
@@ -49,12 +44,7 @@ impl Git {
         match output.status.code() {
             Some(0) => Ok(Some(stdout(&output))),
             Some(1) => Ok(None),
-            _ => bail!(
-                "`git {}` failed ({}): {}",
-                args.join(" "),
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            _ => bail!(failure(args, &output)),
         }
     }
 
@@ -78,4 +68,25 @@ impl Git {
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A short, one-line description of a failed git command: the subcommand and
+/// what git printed, minus its generic advice paragraphs.
+fn failure(args: &[&str], output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !line.starts_with("Please make sure you have the correct access rights")
+                && *line != "and the repository exists."
+        })
+        .collect();
+    let subcommand = args.first().copied().unwrap_or("");
+    if message.is_empty() {
+        format!("`git {subcommand}` failed ({})", output.status)
+    } else {
+        format!("`git {subcommand}` failed: {}", message.join(" / "))
+    }
 }
