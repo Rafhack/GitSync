@@ -137,8 +137,10 @@ and tell the user.
 **Branches (committed history):**
 
 - If the local branch is an ancestor of the peer's branch: fast-forward it. If
-  it is the checked-out branch, only do so when the working tree has no
-  uncommitted changes newer than the last applied snapshot.
+  it is the checked-out branch, this normally happens as part of applying the
+  peer's snapshot (below); otherwise only when nothing at all is uncommitted.
+- Branches that exist only on the peer are not created locally; they stay
+  under `refs/gitsync-peers/<peer>/heads/`.
 - If the peer's branch is an ancestor of ours: nothing to do (they will fetch
   from us).
 - If they diverged: do not merge automatically. Keep the peer's version at
@@ -146,23 +148,45 @@ and tell the user.
   **Default:** no auto-merge of history, because merge commits the user did not
   ask for are confusing and hard to undo.
 
-**Uncommitted work (snapshots):** each machine tracks the last snapshot it has
-"seen" (its own or applied from a peer).
+**Uncommitted work (snapshots):** a snapshot holds a *state*: the commit HEAD
+pointed to plus the whole working tree. To decide whether a peer's state is
+newer than ours, gitsync compares snapshot histories, which needs no clocks:
+each machine snapshots right after applying a peer's state, so its snapshot
+chain records every state it has taken over.
 
-| Local working tree         | Peer snapshot                 | Action                                   |
-|----------------------------|-------------------------------|------------------------------------------|
-| unchanged since last seen  | newer (descends from it)      | apply peer tree to working tree          |
-| changed                    | unchanged                     | nothing; peers will fetch ours           |
-| changed                    | changed (diverged)            | 3-way merge, see below                   |
+| Situation                                            | Action                              |
+|------------------------------------------------------|-------------------------------------|
+| our state equals the peer's                          | in sync; remember it as the base    |
+| the peer's state is in **our** history               | ours is newer; peers will fetch it  |
+| our state is in the **peer's** history               | peer is newer: apply its state      |
+| neither, but our state equals the last base          | peer is newer: apply its state      |
+| neither, and the peer's state equals the last base   | ours is newer                       |
+| neither                                              | both changed: diverged, see below   |
 
-3-way merge uses `git merge-tree --write-tree` with the last common snapshot as
-the base. If it merges cleanly, the result is written to the working tree and
+The checks run top to bottom, so when both readings are possible local work
+wins. The base (`refs/gitsync-state/<peer>/base`, a namespace peers never
+fetch) is the last state both machines had; before the first sync, a clean
+checkout of our HEAD counts as the base. A state the user typed but that was
+not snapshotted yet still counts as a local change.
+
+Applying moves the working tree from our state to theirs with
+`git read-tree -m -u` on a private index: only files that differ are written,
+and git refuses to overwrite a file the user changed since the decision, or
+an untracked file in the way. If the peer's state is based on a newer commit
+of the same branch, the branch is fast-forwarded too (`update-ref` with
+compare-and-swap, so the reflog shows `gitsync: apply <peer>`) and the
+staging area is pointed at the new commit. gitsync snapshots before and after
+applying, so every state stays recoverable from the snapshot history.
+
+Applying waits (and says why in `gitsync status`) while a git operation is in
+progress (`index.lock`, merge, rebase, cherry-pick, revert, bisect) or while
+something is staged, so gitsync never rewrites the user's staging area.
+
+**Diverged (step 6, not built yet):** 3-way merge uses
+`git merge-tree --write-tree` with the last common state as the base. If it merges cleanly, the result is written to the working tree and
 snapshotted. If it conflicts, the working tree is left alone, the peer's
 snapshot is kept under its ref, and `gitsync status` shows the conflicting
 files. `gitsync resolve --take <peer>` or `--keep-mine` settles it.
-
-Applying a snapshot only touches files that differ, and is skipped while a git
-operation is in progress (`.git/index.lock`, rebase or merge in progress).
 
 Different checked-out branches on two machines: snapshots are applied only when
 both machines are on the same branch. Otherwise they are just stored.
@@ -203,7 +227,7 @@ while learning Rust. `git2`/`gix` may replace some `git` calls later for speed.
 1. ✅ Snapshot of uncommitted work to `refs/gitsync/<id>/wip` + `watch` loop.
 2. ✅ Config file and `gitsync status`.
 3. ✅ Fetch from static peers over ssh.
-4. Apply peer snapshots and fast-forward branches (with the safety rules).
+4. ✅ Apply peer snapshots and fast-forward branches (with the safety rules).
 5. mDNS discovery and `gen` announcements.
 6. Conflict handling and `gitsync resolve`.
 7. Run as a background service (systemd user unit, launchd agent, Windows task).

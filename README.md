@@ -20,8 +20,14 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
   `gitsync status` shows how each peer branch compares with yours.
   A peer's `name` must match the `machine_id` it uses.
 
-Applying what was fetched to your files and branches is the next step
-(DESIGN.md, section 9).
+- Fetched work is applied when it is safe: if you have not changed anything
+  since the last sync, the peer's files (and its commits on your branch) are
+  taken over; branches that are simply behind are fast-forwarded. If both
+  machines changed, nothing is touched and `gitsync status` says so.
+  `gitsync watch` does this automatically; `gitsync apply` does it once.
+  See DESIGN.md, section 6.
+
+Merging when both machines changed is the next step (DESIGN.md, section 9).
 
 ## Try it
 
@@ -33,12 +39,13 @@ Applying what was fetched to your files and branches is the next step
 
 ## Code map
 
-- `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`).
+- `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`, `apply`).
 - `src/lib.rs`: lists the modules below (so tests can use them).
 - `src/git.rs`: small wrapper that runs the `git` program.
 - `src/snapshot.rs`: turns uncommitted work into a snapshot commit.
-- `src/watch.rs`: file watcher + polling loop, plus a thread fetching peers.
+- `src/watch.rs`: file watcher + polling loop, plus a thread fetching and applying peers.
 - `src/fetch.rs`: fetches a peer's branches and snapshots.
+- `src/apply.rs`: decides whether a peer's work is newer and applies it.
 - `src/config.rs`: reads and checks `.git/gitsync.toml`.
 - `src/status.rs`: gathers and prints `gitsync status`.
 - `tests/`: tests that create throwaway repos (`common/` has the shared helpers).
