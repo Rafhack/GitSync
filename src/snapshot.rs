@@ -3,7 +3,8 @@
 //! files. See DESIGN.md §2.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{bail, Context, Result};
 
@@ -94,23 +95,20 @@ pub fn has_unsaved_changes(git: &Git, machine_id: &str) -> Result<bool> {
 
 /// Writes the working tree (respecting `.gitignore`) as a tree object and
 /// returns its id, without touching the user's index.
-fn working_tree(git: &Git) -> Result<String> {
+pub fn working_tree(git: &Git) -> Result<String> {
     let git_dir = git.git_dir()?;
 
     // Private copy of the index. Copying keeps git's file-stat cache, so
     // `git add -A` below only re-reads files that actually changed.
-    let temp_index = TempIndex(git_dir.join(format!("gitsync-index.{}", std::process::id())));
+    let temp_index = TempIndex::new(&git_dir);
     let real_index = git_dir.join("index");
     if real_index.exists() {
-        fs::copy(&real_index, &temp_index.0).context("copying .git/index")?;
-    } else {
-        // Fresh repo with nothing staged yet: start from an empty index.
-        let _ = fs::remove_file(&temp_index.0);
+        fs::copy(&real_index, temp_index.path()).context("copying .git/index")?;
     }
-    let index_path = temp_index.0.to_str().context("non UTF-8 path to .git")?;
-    let index_env = [("GIT_INDEX_FILE", index_path)];
+    // (Fresh repo with nothing staged yet: git starts from an empty index.)
 
     // Stage everything into the private index and turn it into a tree.
+    let index_env = [("GIT_INDEX_FILE", temp_index.path_str()?)];
     git.run_env(&["add", "-A"], &index_env)?;
     git.run_env(&["write-tree"], &index_env)
 }
@@ -168,8 +166,27 @@ fn sanitize_machine_id(host: &str) -> String {
     }
 }
 
-/// Deletes the private index file when the snapshot finishes, even on error.
-struct TempIndex(PathBuf);
+/// A private index file in `.git/`, so gitsync can stage things without
+/// touching the user's staging area. Deleted when dropped, even on error.
+pub(crate) struct TempIndex(PathBuf);
+
+impl TempIndex {
+    /// A fresh, unique path (unique per process and per call, so threads
+    /// cannot clobber each other's index). The file does not exist yet.
+    pub(crate) fn new(git_dir: &Path) -> Self {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self(git_dir.join(format!("gitsync-index.{}.{n}", std::process::id())))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub(crate) fn path_str(&self) -> Result<&str> {
+        self.0.to_str().context("non UTF-8 path to .git")
+    }
+}
 
 impl Drop for TempIndex {
     fn drop(&mut self) {
