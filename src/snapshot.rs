@@ -27,38 +27,16 @@ pub fn wip_ref(machine_id: &str) -> String {
 /// files) as a snapshot commit, unless it is identical to the previous one.
 pub fn snapshot(git: &Git, machine_id: &str) -> Result<Outcome> {
     let wip = wip_ref(machine_id);
-    let git_dir = git.git_dir()?;
 
-    // 1. Private copy of the index. Copying keeps git's file-stat cache, so
-    //    `git add -A` below only re-reads files that actually changed.
-    let temp_index = TempIndex(git_dir.join(format!("gitsync-index.{}", std::process::id())));
-    let real_index = git_dir.join("index");
-    if real_index.exists() {
-        fs::copy(&real_index, &temp_index.0).context("copying .git/index")?;
-    } else {
-        // Fresh repo with nothing staged yet: start from an empty index.
-        let _ = fs::remove_file(&temp_index.0);
-    }
-    let index_path = temp_index.0.to_str().context("non UTF-8 path to .git")?;
-    let index_env = [("GIT_INDEX_FILE", index_path)];
-
-    // 2 and 3. Stage everything into the private index and turn it into a tree.
-    git.run_env(&["add", "-A"], &index_env)?;
-    let tree = git.run_env(&["write-tree"], &index_env)?;
+    // 1 to 3. The working tree as a git tree object.
+    let tree = working_tree(git)?;
 
     // 4. Skip if nothing changed since the previous snapshot.
     let head = git.try_run(&["rev-parse", "--verify", "-q", "HEAD"])?;
     let head_trailer = head.as_deref().unwrap_or("none");
     let prev = git.try_run(&["rev-parse", "--verify", "-q", &wip])?;
     if let Some(prev) = &prev {
-        let prev_tree = git.run(&["rev-parse", &format!("{prev}^{{tree}}")])?;
-        let prev_head = git.run(&[
-            "log",
-            "-1",
-            "--format=%(trailers:key=gitsync-head,valueonly)",
-            prev,
-        ])?;
-        if prev_tree == tree && prev_head == head_trailer {
+        if is_same_snapshot(git, prev, &tree, head_trailer)? {
             return Ok(Outcome::Unchanged);
         }
     }
@@ -99,6 +77,54 @@ pub fn snapshot(git: &Git, machine_id: &str) -> Result<Outcome> {
     ])?;
 
     Ok(Outcome::Created(commit))
+}
+
+/// True if [`snapshot`] would create a new snapshot right now: the working
+/// tree or HEAD changed since the latest one, or there is none yet.
+/// Does not create a snapshot.
+pub fn has_unsaved_changes(git: &Git, machine_id: &str) -> Result<bool> {
+    let Some(prev) = git.try_run(&["rev-parse", "--verify", "-q", &wip_ref(machine_id)])? else {
+        return Ok(true);
+    };
+    let tree = working_tree(git)?;
+    let head = git.try_run(&["rev-parse", "--verify", "-q", "HEAD"])?;
+    let same = is_same_snapshot(git, &prev, &tree, head.as_deref().unwrap_or("none"))?;
+    Ok(!same)
+}
+
+/// Writes the working tree (respecting `.gitignore`) as a tree object and
+/// returns its id, without touching the user's index.
+fn working_tree(git: &Git) -> Result<String> {
+    let git_dir = git.git_dir()?;
+
+    // Private copy of the index. Copying keeps git's file-stat cache, so
+    // `git add -A` below only re-reads files that actually changed.
+    let temp_index = TempIndex(git_dir.join(format!("gitsync-index.{}", std::process::id())));
+    let real_index = git_dir.join("index");
+    if real_index.exists() {
+        fs::copy(&real_index, &temp_index.0).context("copying .git/index")?;
+    } else {
+        // Fresh repo with nothing staged yet: start from an empty index.
+        let _ = fs::remove_file(&temp_index.0);
+    }
+    let index_path = temp_index.0.to_str().context("non UTF-8 path to .git")?;
+    let index_env = [("GIT_INDEX_FILE", index_path)];
+
+    // Stage everything into the private index and turn it into a tree.
+    git.run_env(&["add", "-A"], &index_env)?;
+    git.run_env(&["write-tree"], &index_env)
+}
+
+/// True if snapshot commit `snapshot` has this tree and was based on this HEAD.
+fn is_same_snapshot(git: &Git, snapshot: &str, tree: &str, head_trailer: &str) -> Result<bool> {
+    let snapshot_tree = git.run(&["rev-parse", &format!("{snapshot}^{{tree}}")])?;
+    let snapshot_head = git.run(&[
+        "log",
+        "-1",
+        "--format=%(trailers:key=gitsync-head,valueonly)",
+        snapshot,
+    ])?;
+    Ok(snapshot_tree == tree && snapshot_head == head_trailer)
 }
 
 /// The machine id used when none is given: the hostname, made safe for use

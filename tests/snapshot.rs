@@ -1,38 +1,14 @@
 //! Snapshot tests. Each test builds a throwaway git repo in a temp directory.
 
-use std::fs;
-use std::path::Path;
+mod common;
 
+use std::fs;
+
+use common::{empty_repo, repo, write};
 use gitsync::git::Git;
 use gitsync::snapshot::{snapshot, wip_ref, Outcome};
-use tempfile::TempDir;
 
 const ID: &str = "testbox";
-
-/// An empty repo with a local identity (so tests don't depend on global git config).
-fn empty_repo() -> (TempDir, Git) {
-    let dir = TempDir::new().unwrap();
-    let git = Git::new(dir.path());
-    git.run(&["init", "-q", "-b", "main"]).unwrap();
-    git.run(&["config", "user.name", "Test"]).unwrap();
-    git.run(&["config", "user.email", "test@example.com"])
-        .unwrap();
-    (dir, git)
-}
-
-/// A repo with one commit containing `a.txt` and `b.txt`.
-fn repo() -> (TempDir, Git) {
-    let (dir, git) = empty_repo();
-    write(dir.path(), "a.txt", "a\n");
-    write(dir.path(), "b.txt", "b\n");
-    git.run(&["add", "."]).unwrap();
-    git.run(&["commit", "-q", "-m", "initial"]).unwrap();
-    (dir, git)
-}
-
-fn write(dir: &Path, name: &str, contents: &str) {
-    fs::write(dir.join(name), contents).unwrap();
-}
 
 fn created(outcome: Outcome) -> String {
     match outcome {
