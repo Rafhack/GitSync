@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -87,12 +86,7 @@ fn main() -> Result<()> {
             }
             Outcome::Unchanged => println!("no changes since last snapshot"),
         },
-        Command::Watch { .. } => watch::watch(
-            &git,
-            &machine_id,
-            Duration::from_millis(config.debounce_ms),
-            Duration::from_secs(config.poll_interval_secs),
-        )?,
+        Command::Watch { .. } => watch::watch(&git, &machine_id, &config)?,
         Command::Fetch { peer } => fetch(&git, &config, peer.as_deref())?,
         Command::Status => print!("{}", Status::collect(&git, &machine_id, config)?),
     }

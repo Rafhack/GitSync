@@ -4,10 +4,11 @@
 mod common;
 
 use common::{clone_of, commit, repo, write};
-use gitsync::config::Peer;
+use gitsync::config::{Config, Peer};
 use gitsync::fetch::fetch_peer;
 use gitsync::git::Git;
 use gitsync::snapshot::snapshot;
+use gitsync::status::{Relation, Status};
 
 fn peer(dir: &tempfile::TempDir) -> Peer {
     Peer {
@@ -102,4 +103,53 @@ fn unreachable_peer_is_an_error_naming_the_peer() {
     let err = format!("{:#}", fetch_peer(&laptop, &gone).unwrap_err());
 
     assert!(err.contains("desktop"), "{err}");
+}
+
+#[test]
+fn status_compares_peer_branches_with_ours() {
+    let (dir, laptop) = repo();
+    let (desk_dir, desktop) = clone_of(dir.path());
+    // ahead: desktop committed on main.
+    commit(desk_dir.path(), &desktop, "a.txt", "desktop\n");
+    // behind: laptop committed on "mine", desktop has the old version.
+    laptop.run(&["branch", "mine"]).unwrap();
+    desktop.run(&["branch", "mine", "origin/main"]).unwrap();
+    laptop.run(&["checkout", "-q", "mine"]).unwrap();
+    commit(dir.path(), &laptop, "b.txt", "laptop\n");
+    laptop.run(&["checkout", "-q", "main"]).unwrap();
+    // diverged: both committed on "both".
+    laptop.run(&["branch", "both"]).unwrap();
+    desktop
+        .run(&["checkout", "-q", "-b", "both", "origin/main"])
+        .unwrap();
+    commit(desk_dir.path(), &desktop, "c.txt", "desktop\n");
+    laptop.run(&["checkout", "-q", "both"]).unwrap();
+    commit(dir.path(), &laptop, "c.txt", "laptop\n");
+    laptop.run(&["checkout", "-q", "main"]).unwrap();
+    // only on peer.
+    desktop.run(&["branch", "theirs"]).unwrap();
+    // same.
+    laptop.run(&["branch", "same"]).unwrap();
+    desktop.run(&["branch", "same", "origin/main"]).unwrap();
+
+    let config = Config {
+        peers: vec![peer(&desk_dir)],
+        ..Config::default()
+    };
+    fetch_peer(&laptop, &config.peers[0]).unwrap();
+    let status = Status::collect(&laptop, "laptop", config).unwrap();
+
+    let relation = |name: &str| {
+        status.peer_branches[0]
+            .iter()
+            .find(|b| b.name == name)
+            .unwrap_or_else(|| panic!("no peer branch {name}"))
+            .relation
+    };
+    assert_eq!(relation("main"), Relation::PeerAhead(1));
+    assert_eq!(relation("mine"), Relation::PeerBehind(1));
+    assert_eq!(relation("both"), Relation::Diverged { ours: 1, theirs: 1 });
+    assert_eq!(relation("theirs"), Relation::OnlyOnPeer);
+    assert_eq!(relation("same"), Relation::Same);
+    assert!(status.to_string().contains("1 commit(s) ahead of yours"));
 }

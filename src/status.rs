@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::config::{Config, Discovery};
+use crate::fetch::peer_heads_prefix;
 use crate::git::Git;
 use crate::snapshot::{has_unsaved_changes, wip_ref};
 
@@ -26,6 +27,31 @@ pub struct Status {
     pub unsaved_changes: bool,
     /// Snapshots from other machines found in this repo, by machine id.
     pub other_snapshots: Vec<(String, SnapshotInfo)>,
+    /// Fetched branches of each configured peer, in config order.
+    /// Empty for a peer that was never fetched.
+    pub peer_branches: Vec<Vec<PeerBranch>>,
+}
+
+/// A branch fetched from a peer, compared with our branch of the same name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerBranch {
+    pub name: String,
+    pub commit: String,
+    pub relation: Relation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// Same commit as our branch.
+    Same,
+    /// The peer has this many commits we don't (we can fast-forward).
+    PeerAhead(usize),
+    /// We have this many commits the peer doesn't (the peer will fetch them).
+    PeerBehind(usize),
+    /// Both sides have commits the other doesn't.
+    Diverged { ours: usize, theirs: usize },
+    /// We have no branch with this name.
+    OnlyOnPeer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +88,14 @@ impl Status {
             }
         }
 
+        let peer_branches = config
+            .peers
+            .iter()
+            .map(|peer| peer_branches(git, &peer.name))
+            .collect::<Result<_>>()?;
+
         Ok(Self {
+            peer_branches,
             machine_id: machine_id.to_string(),
             config_found: config_path.exists(),
             config_path,
@@ -90,6 +123,62 @@ fn snapshot_info(git: &Git, rev: &str) -> Result<SnapshotInfo> {
         age: next(),
         branch: next(),
     })
+}
+
+fn peer_branches(git: &Git, peer: &str) -> Result<Vec<PeerBranch>> {
+    let prefix = peer_heads_prefix(peer);
+    let refs = git.run(&["for-each-ref", "--format=%(objectname) %(refname)", &prefix])?;
+    let mut branches = Vec::new();
+    for line in refs.lines() {
+        let Some((commit, refname)) = line.split_once(' ') else {
+            continue;
+        };
+        let name = refname.strip_prefix(&prefix).unwrap_or(refname).to_string();
+        let local = format!("refs/heads/{name}");
+        let relation = if git
+            .try_run(&["rev-parse", "--verify", "-q", &local])?
+            .is_none()
+        {
+            Relation::OnlyOnPeer
+        } else {
+            // "<ours> <theirs>": commits only on our side, only on theirs.
+            let counts = git.run(&[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{local}...{refname}"),
+            ])?;
+            let mut counts = counts
+                .split_whitespace()
+                .map(|n| n.parse::<usize>().unwrap_or(0));
+            match (counts.next().unwrap_or(0), counts.next().unwrap_or(0)) {
+                (0, 0) => Relation::Same,
+                (0, theirs) => Relation::PeerAhead(theirs),
+                (ours, 0) => Relation::PeerBehind(ours),
+                (ours, theirs) => Relation::Diverged { ours, theirs },
+            }
+        };
+        branches.push(PeerBranch {
+            name,
+            commit: commit.to_string(),
+            relation,
+        });
+    }
+    Ok(branches)
+}
+
+impl fmt::Display for Relation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Relation::Same => write!(f, "same as yours"),
+            Relation::PeerAhead(n) => write!(f, "{n} commit(s) ahead of yours"),
+            Relation::PeerBehind(n) => write!(f, "{n} commit(s) behind yours"),
+            Relation::Diverged { ours, theirs } => {
+                write!(f, "diverged: {ours} yours only, {theirs} theirs only")
+            }
+            Relation::OnlyOnPeer => write!(f, "only on this peer"),
+        }
+    }
 }
 
 fn short(commit: &str) -> &str {
@@ -134,8 +223,20 @@ impl fmt::Display for Status {
             writeln!(f, "peers     none listed")?;
         } else {
             writeln!(f, "peers")?;
-            for peer in &self.config.peers {
+            for (peer, branches) in self.config.peers.iter().zip(&self.peer_branches) {
                 writeln!(f, "  {}  {}", peer.name, peer.url)?;
+                if branches.is_empty() {
+                    writeln!(f, "    (not fetched yet; run `gitsync fetch`)")?;
+                }
+                for branch in branches {
+                    writeln!(
+                        f,
+                        "    {}  {}  {}",
+                        branch.name,
+                        short(&branch.commit),
+                        branch.relation
+                    )?;
+                }
             }
         }
 
