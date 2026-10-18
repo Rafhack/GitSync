@@ -2,3 +2,4 @@
 
 pub mod git;
 pub mod snapshot;
+pub mod watch;
