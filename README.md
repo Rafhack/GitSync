@@ -10,6 +10,10 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
   touching your staging area or files.
 - `gitsync watch` does that automatically whenever files change, plus a poll
   every 30 seconds as a safety net.
+- `gitsync status` shows this machine's latest snapshot, whether there are
+  changes not in a snapshot yet, the settings, and other machines' snapshots.
+- Optional settings file `.git/gitsync.toml` (see DESIGN.md, section 7).
+  Command line flags override it.
 
 Syncing to other machines is the next step (DESIGN.md, section 9).
 
@@ -23,9 +27,11 @@ Syncing to other machines is the next step (DESIGN.md, section 9).
 
 ## Code map
 
-- `src/main.rs`: command line (`snapshot`, `watch`).
+- `src/main.rs`: command line (`snapshot`, `watch`, `status`).
 - `src/lib.rs`: lists the modules below (so tests can use them).
 - `src/git.rs`: small wrapper that runs the `git` program.
 - `src/snapshot.rs`: turns uncommitted work into a snapshot commit.
 - `src/watch.rs`: file watcher + polling loop.
-- `tests/snapshot.rs`: tests that create throwaway repos.
+- `src/config.rs`: reads and checks `.git/gitsync.toml`.
+- `src/status.rs`: gathers and prints `gitsync status`.
+- `tests/`: tests that create throwaway repos (`common/` has the shared helpers).

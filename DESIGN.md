@@ -67,6 +67,7 @@ The message carries trailers such as `gitsync-machine: laptop` and
 `gitsync-branch: main`.
 
 This piece is built: `gitsync snapshot` and `gitsync watch`.
+`gitsync status` shows whether the working tree has changes not in a snapshot yet.
 
 ## 3. Watching for changes
 
@@ -190,7 +191,7 @@ while learning Rust. `git2`/`gix` may replace some `git` calls later for speed.
 ## 9. Build plan
 
 1. ✅ Snapshot of uncommitted work to `refs/gitsync/<id>/wip` + `watch` loop.
-2. Config file and `gitsync status`.
+2. ✅ Config file and `gitsync status`.
 3. Fetch from static peers over ssh.
 4. Apply peer snapshots and fast-forward branches (with the safety rules).
 5. mDNS discovery and `gen` announcements.
