@@ -4,11 +4,14 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use gitsync::config::Config;
 use gitsync::git::Git;
 use gitsync::snapshot::{self, Outcome};
 use gitsync::watch;
 
 /// Keep a git repository, including uncommitted work, in sync across machines.
+///
+/// Settings are read from .git/gitsync.toml when it exists; flags override it.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -16,7 +19,7 @@ struct Cli {
     #[arg(short = 'C', global = true, default_value = ".")]
     dir: PathBuf,
 
-    /// Name of this machine in ref names (default: hostname).
+    /// Name of this machine in ref names (default: config file, then hostname).
     #[arg(long, global = true)]
     machine_id: Option<String>,
 
@@ -30,12 +33,14 @@ enum Command {
     Snapshot,
     /// Snapshot automatically whenever files change. Ctrl+C to stop.
     Watch {
-        /// Snapshot at least this often, even without file events.
-        #[arg(long, default_value_t = 30)]
-        poll_secs: u64,
-        /// Wait for this much quiet after a change before snapshotting.
-        #[arg(long, default_value_t = 1000)]
-        debounce_ms: u64,
+        /// Snapshot at least this often, even without file events
+        /// (default: poll_interval_secs from the config, else 30).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        poll_secs: Option<u64>,
+        /// Wait for this much quiet after a change before snapshotting
+        /// (default: debounce_ms from the config, else 1000).
+        #[arg(long)]
+        debounce_ms: Option<u64>,
     },
 }
 
@@ -49,13 +54,22 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let git = Git::new(cli.dir);
-    let machine_id = match cli.machine_id {
-        Some(id) => {
-            snapshot::validate_machine_id(&id)?;
-            id
-        }
-        None => snapshot::default_machine_id()?,
-    };
+
+    // Effective settings: config file, then command line flags on top.
+    let mut config = Config::load(&git)?;
+    if let Some(id) = cli.machine_id {
+        config.machine_id = Some(id);
+    }
+    if let Command::Watch {
+        poll_secs,
+        debounce_ms,
+    } = &cli.command
+    {
+        config.poll_interval_secs = poll_secs.unwrap_or(config.poll_interval_secs);
+        config.debounce_ms = debounce_ms.unwrap_or(config.debounce_ms);
+    }
+    config.validate()?;
+    let machine_id = config.machine_id_or_default()?;
 
     match cli.command {
         Command::Snapshot => match snapshot::snapshot(&git, &machine_id)? {
@@ -64,14 +78,11 @@ fn main() -> Result<()> {
             }
             Outcome::Unchanged => println!("no changes since last snapshot"),
         },
-        Command::Watch {
-            poll_secs,
-            debounce_ms,
-        } => watch::watch(
+        Command::Watch { .. } => watch::watch(
             &git,
             &machine_id,
-            Duration::from_millis(debounce_ms),
-            Duration::from_secs(poll_secs),
+            Duration::from_millis(config.debounce_ms),
+            Duration::from_secs(config.poll_interval_secs),
         )?,
     }
     Ok(())
