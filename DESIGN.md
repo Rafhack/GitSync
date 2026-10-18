@@ -113,6 +113,16 @@ git fetch ssh://user@desktop.local/path/to/repo \
 
 - Peer branches land in a private namespace, never directly on the user's
   branches.
+- Only the peer's *own* snapshots are fetched, so a peer can never overwrite
+  our snapshot or relay a third machine's. This is why a peer's `name` in the
+  config must equal that peer's `machine_id`; `gitsync fetch` warns when it
+  finds no snapshot under that name.
+- ssh runs with `BatchMode=yes` (never prompts) and connection/keepalive
+  timeouts, unless the user configured their own `GIT_SSH_COMMAND` or
+  `core.sshCommand`. FETCH_HEAD is not written, so the user's own
+  `git fetch`/`git pull` state is left alone.
+- `gitsync watch` fetches static peers every poll interval on a separate
+  thread, so an unreachable peer never delays snapshots.
 - **Default: use the system `git` and `ssh` binaries** instead of a git library.
   This reuses the user's existing ssh keys, `~/.ssh/config` and agent with zero
   extra setup, and behaves exactly like the git the user already knows.
@@ -192,7 +202,7 @@ while learning Rust. `git2`/`gix` may replace some `git` calls later for speed.
 
 1. ✅ Snapshot of uncommitted work to `refs/gitsync/<id>/wip` + `watch` loop.
 2. ✅ Config file and `gitsync status`.
-3. Fetch from static peers over ssh.
+3. ✅ Fetch from static peers over ssh.
 4. Apply peer snapshots and fast-forward branches (with the safety rules).
 5. mDNS discovery and `gen` announcements.
 6. Conflict handling and `gitsync resolve`.
