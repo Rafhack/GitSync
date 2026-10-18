@@ -1,0 +1,17 @@
+[package]
+name = "gitsync"
+version = "0.1.0"
+edition = "2021"
+description = "Keep a git repository, including uncommitted work, in sync across machines on a LAN"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+gethostname = "1"
+notify = "8"
+notify-debouncer-full = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
