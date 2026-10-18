@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use gitsync::config::Config;
 use gitsync::git::Git;
 use gitsync::snapshot::{self, Outcome};
+use gitsync::status::Status;
 use gitsync::watch;
 
 /// Keep a git repository, including uncommitted work, in sync across machines.
@@ -42,6 +43,8 @@ enum Command {
         #[arg(long)]
         debounce_ms: Option<u64>,
     },
+    /// Show this machine's snapshot, settings and known peers.
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -84,6 +87,7 @@ fn main() -> Result<()> {
             Duration::from_millis(config.debounce_ms),
             Duration::from_secs(config.poll_interval_secs),
         )?,
+        Command::Status => print!("{}", Status::collect(&git, &machine_id, config)?),
     }
     Ok(())
 }

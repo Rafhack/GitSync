@@ -3,4 +3,5 @@
 pub mod config;
 pub mod git;
 pub mod snapshot;
+pub mod status;
 pub mod watch;
