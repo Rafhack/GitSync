@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::apply::{plan, Plan};
 use crate::config::{Config, Discovery};
 use crate::fetch::peer_heads_prefix;
 use crate::git::Git;
@@ -30,6 +31,8 @@ pub struct Status {
     /// Fetched branches of each configured peer, in config order.
     /// Empty for a peer that was never fetched.
     pub peer_branches: Vec<Vec<PeerBranch>>,
+    /// What would happen with each configured peer's snapshot, in config order.
+    pub peer_plans: Vec<Plan>,
 }
 
 /// A branch fetched from a peer, compared with our branch of the same name.
@@ -94,8 +97,15 @@ impl Status {
             .map(|peer| peer_branches(git, &peer.name))
             .collect::<Result<_>>()?;
 
+        let peer_plans = config
+            .peers
+            .iter()
+            .map(|peer| plan(git, machine_id, &peer.name))
+            .collect::<Result<_>>()?;
+
         Ok(Self {
             peer_branches,
+            peer_plans,
             machine_id: machine_id.to_string(),
             config_found: config_path.exists(),
             config_path,
@@ -223,8 +233,10 @@ impl fmt::Display for Status {
             writeln!(f, "peers     none listed")?;
         } else {
             writeln!(f, "peers")?;
-            for (peer, branches) in self.config.peers.iter().zip(&self.peer_branches) {
+            let peers = self.config.peers.iter().zip(&self.peer_branches);
+            for ((peer, branches), plan) in peers.zip(&self.peer_plans) {
                 writeln!(f, "  {}  {}", peer.name, peer.url)?;
+                writeln!(f, "    sync: {plan}")?;
                 if branches.is_empty() {
                     writeln!(f, "    (not fetched yet; run `gitsync fetch`)")?;
                 }
