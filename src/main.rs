@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
 use gitsync::config::Config;
+use gitsync::fetch::fetch_peer;
 use gitsync::git::Git;
 use gitsync::snapshot::{self, Outcome};
 use gitsync::status::Status;
@@ -45,6 +46,11 @@ enum Command {
     },
     /// Show this machine's snapshot, settings and known peers.
     Status,
+    /// Fetch branches and snapshots from the peers in the config (or one peer).
+    Fetch {
+        /// Only this peer (its `name` in the config).
+        peer: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -87,7 +93,57 @@ fn main() -> Result<()> {
             Duration::from_millis(config.debounce_ms),
             Duration::from_secs(config.poll_interval_secs),
         )?,
+        Command::Fetch { peer } => fetch(&git, &config, peer.as_deref())?,
         Command::Status => print!("{}", Status::collect(&git, &machine_id, config)?),
+    }
+    Ok(())
+}
+
+/// `gitsync fetch`: fetch every configured peer (or one), print what changed.
+/// Keeps going if one peer fails, but exits with an error at the end.
+fn fetch(git: &Git, config: &Config, only: Option<&str>) -> Result<()> {
+    let peers: Vec<_> = config
+        .peers
+        .iter()
+        .filter(|peer| only.is_none_or(|name| peer.name == name))
+        .collect();
+    if peers.is_empty() {
+        match only {
+            Some(name) => bail!("no peer named {name:?} in the config"),
+            None => bail!("no peers in the config; add [[peers]] to .git/gitsync.toml"),
+        }
+    }
+
+    let mut failed = 0;
+    for peer in peers {
+        match fetch_peer(git, peer) {
+            Ok(report) => {
+                if report.changes.is_empty() {
+                    println!("{}: up to date", peer.name);
+                }
+                for change in &report.changes {
+                    let what = match (&change.old, &change.new) {
+                        (None, Some(new)) => format!("new {}", &new[..12]),
+                        (Some(old), Some(new)) => format!("{}..{}", &old[..12], &new[..12]),
+                        (_, None) => "deleted".to_string(),
+                    };
+                    println!("{}: {} {what}", peer.name, change.name);
+                }
+                if !report.has_snapshot {
+                    println!(
+                        "{}: note: no snapshot found; is gitsync running there with machine_id = {:?}?",
+                        peer.name, peer.name
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("{}: {err:#}", peer.name);
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} peer(s) could not be fetched");
     }
     Ok(())
 }

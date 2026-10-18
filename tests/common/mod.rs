@@ -32,3 +32,30 @@ pub fn repo() -> (TempDir, Git) {
 pub fn write(dir: &Path, name: &str, contents: &str) {
     fs::write(dir.join(name), contents).unwrap();
 }
+
+/// A clone of `source`, standing in for a second machine.
+pub fn clone_of(source: &Path) -> (TempDir, Git) {
+    let dir = TempDir::new().unwrap();
+    let git = Git::new(dir.path());
+    Git::new(".")
+        .run(&[
+            "clone",
+            "-q",
+            source.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+        ])
+        .unwrap();
+    git.run(&["config", "user.name", "Test"]).unwrap();
+    git.run(&["config", "user.email", "test@example.com"])
+        .unwrap();
+    (dir, git)
+}
+
+/// Makes a commit touching `file`.
+pub fn commit(dir: &Path, git: &Git, file: &str, contents: &str) -> String {
+    write(dir, file, contents);
+    git.run(&["add", file]).unwrap();
+    git.run(&["commit", "-q", "-m", &format!("edit {file}")])
+        .unwrap();
+    git.run(&["rev-parse", "HEAD"]).unwrap()
+}
