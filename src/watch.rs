@@ -14,7 +14,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use tracing::{debug, info, warn};
 
-use crate::apply::sync_peer;
+use crate::apply::{sync_peer, Plan};
 use crate::config::{Config, Discovery, Peer};
 use crate::discovery::{ipv6_note, Announcement, Mdns, PeerEvent};
 use crate::fetch::fetch_peer;
@@ -434,8 +434,13 @@ impl PeerLoop {
         match report {
             Ok(report) => {
                 if !report.applied_files.is_empty() {
+                    let verb = if matches!(report.plan, Some(Plan::Merge { .. })) {
+                        "merged"
+                    } else {
+                        "applied"
+                    };
                     info!(
-                        "applied changes from {name}: {}",
+                        "{verb} changes from {name}: {}",
                         report.applied_files.join(", ")
                     );
                 }

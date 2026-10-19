@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
-use gitsync::apply::{sync_peer, Plan};
+use gitsync::apply::{self as sync, sync_peer, Plan, Side};
 use gitsync::config::{Config, Discovery, Peer};
 use gitsync::discovery::{ipv6_note, Announcement, Found, Mdns, PeerEvent};
 use gitsync::fetch::{fetch_peer, fetched_peer_names, ssh_target};
@@ -60,6 +60,18 @@ enum Command {
         /// Only this peer (its `name` in the config).
         peer: Option<String>,
     },
+    /// Show conflicts with peers (both sides changed the same lines), or
+    /// settle one: the chosen side wins where both changed the same lines;
+    /// changes made on only one side are kept either way.
+    Resolve {
+        /// Take the peer's version of the conflicting lines.
+        #[arg(long, value_name = "PEER", conflicts_with = "keep_mine")]
+        take: Option<String>,
+        /// Keep your version of the conflicting lines (with every peer in
+        /// conflict, or just PEER).
+        #[arg(long, value_name = "PEER", num_args = 0..=1, default_missing_value = "")]
+        keep_mine: Option<String>,
+    },
     /// List the peers for this repo announcing themselves on the LAN (mDNS).
     Discover {
         /// How long to listen.
@@ -105,6 +117,9 @@ fn main() -> Result<()> {
         Command::Watch { .. } => watch::watch(&git, &machine_id, &config)?,
         Command::Fetch { peer } => fetch(&git, &machine_id, &config, peer.as_deref())?,
         Command::Apply { peer } => apply(&git, &machine_id, &config, peer.as_deref())?,
+        Command::Resolve { take, keep_mine } => {
+            resolve(&git, &machine_id, &config, take, keep_mine)?
+        }
         Command::Discover { secs } => discover(&git, &machine_id, &config, secs)?,
         Command::Status => print!("{}", Status::collect(&git, &machine_id, config)?),
     }
@@ -161,17 +176,16 @@ fn fetch(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Re
 /// `gitsync apply`: apply what was already fetched, peer by peer: the
 /// configured peers and any found on the LAN and fetched before.
 fn apply(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Result<()> {
-    let mut peers = config.peers.clone();
-    for name in fetched_peer_names(git)? {
-        if name != machine_id && !peers.iter().any(|p| p.name == name) {
-            peers.push(Peer::new(name, ""));
-        }
-    }
-    for peer in select(peers, only)? {
+    for peer in select(known_peers(git, machine_id, config)?, only)? {
         let report = sync_peer(git, machine_id, &peer.name)?;
         match &report.plan {
-            Some(Plan::Apply { .. }) => {
-                println!("{}: applied", peer.name);
+            Some(plan @ (Plan::Apply { .. } | Plan::Merge { .. })) => {
+                let verb = if matches!(plan, Plan::Merge { .. }) {
+                    "merged"
+                } else {
+                    "applied"
+                };
+                println!("{}: {verb}", peer.name);
                 for file in &report.applied_files {
                     println!("  {file}");
                 }
@@ -186,6 +200,79 @@ fn apply(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Re
                 &old[..12],
                 &new[..12]
             );
+        }
+    }
+    Ok(())
+}
+
+/// Every peer that was fetched or is in the config, except this machine.
+fn known_peers(git: &Git, machine_id: &str, config: &Config) -> Result<Vec<Peer>> {
+    let mut peers = config.peers.clone();
+    for name in fetched_peer_names(git)? {
+        if name != machine_id && !peers.iter().any(|p| p.name == name) {
+            peers.push(Peer::new(name, ""));
+        }
+    }
+    Ok(peers)
+}
+
+/// `gitsync resolve`: list conflicts, or settle them (`--take <peer>`,
+/// `--keep-mine [peer]`).
+fn resolve(
+    git: &Git,
+    machine_id: &str,
+    config: &Config,
+    take: Option<String>,
+    keep_mine: Option<String>,
+) -> Result<()> {
+    let (side, only) = match (take, keep_mine) {
+        (Some(peer), _) => (Some(Side::Theirs), Some(peer)),
+        (None, Some(peer)) => (Some(Side::Mine), Some(peer).filter(|p| !p.is_empty())),
+        (None, None) => (None, None),
+    };
+    // Compare against what is on disk now (and let `git diff` below show it).
+    snapshot::snapshot(git, machine_id)?;
+    let mut conflicts = Vec::new();
+    for peer in select(known_peers(git, machine_id, config)?, only.as_deref())? {
+        if let Plan::Conflict { files } = sync::plan(git, machine_id, &peer.name)? {
+            conflicts.push((peer.name, files));
+        }
+    }
+    if conflicts.is_empty() {
+        println!("no conflicts");
+        return Ok(());
+    }
+
+    let Some(side) = side else {
+        for (peer, files) in &conflicts {
+            let theirs = snapshot::wip_ref(peer);
+            let mine = snapshot::wip_ref(machine_id);
+            println!("{peer}: both sides changed these files in ways that do not merge");
+            println!("(the same lines, or one side deleted the file):");
+            for file in files {
+                println!("  {file}");
+            }
+            println!("  compare:            git diff {mine} {theirs} -- <file>");
+            println!("  see their version:  git show {theirs}:<file>");
+        }
+        println!();
+        println!("settle it with one of:");
+        println!("  gitsync resolve --take <peer>   their version of the conflicting lines");
+        println!("  gitsync resolve --keep-mine     your version (edit the files first to combine by hand)");
+        println!("changes made on only one side are kept either way");
+        return Ok(());
+    };
+
+    for (peer, _) in &conflicts {
+        let report = sync::resolve(git, machine_id, peer, side)?;
+        let whose = if side == Side::Mine {
+            "yours"
+        } else {
+            "theirs"
+        };
+        println!("{peer}: resolved, keeping {whose} where both changed the same lines");
+        for file in &report.applied_files {
+            println!("  {file}");
         }
     }
     Ok(())
