@@ -78,28 +78,61 @@ This piece is built: `gitsync snapshot` and `gitsync watch`.
   anyway. This catches what watchers miss: network drives, editors that swap
   files, a watcher that hit the OS limit, and commits made by other tools.
   Polling is cheap because step 4 above skips unchanged trees.
-- Events inside `.git/` are ignored, so gitsync's own writes do not trigger
-  itself.
+- Events inside `.git/` are ignored, so gitsync's own writes (objects, its
+  refs, its private index) do not trigger itself. The exceptions are the
+  user's own branch moves: `HEAD`, `refs/heads/` and `packed-refs`. A commit
+  only touches `.git/`, and peers should hear about it at once, not at the
+  next poll.
 
 ## 4. Finding peers on the LAN
 
 **Default: mDNS / DNS-SD** (the same mechanism printers and AirPlay use), with
 the `mdns-sd` crate, which is pure Rust and works on all three OSes.
 
-- Each daemon advertises a service `_gitsync._tcp.local.` with TXT records:
+- Each `gitsync watch` advertises a service `_gitsync._tcp.local.` per repo
+  (instance `<machine>-<repo id>`, port = the ssh port) with TXT records:
   - `machine` = machine id
-  - `repo` = a repo id (hash of the repo's first commit, so only peers with the
-    same project match)
-  - `path` = path to the repo on that machine (used in the ssh URL)
-  - `user` = ssh user
-  - `gen` = a counter bumped on every new snapshot or ref change
-- Peers browse for that service. When a peer's `gen` changes, that is the
-  "I have news" signal and triggers a fetch.
-- **Fallback:** a static list of peers in the config file, for networks that
-  block multicast (some corporate Wi-Fi). Static peers are simply polled.
+  - `repo` = repo id: the repo's first commit, so only peers with the same
+    project match
+  - `user`, `path` = how to reach the repo over ssh. On Windows the path is
+    in Git Bash form (`/c/Users/...`), since peers reach it through Git Bash
+    (section 5). Both can be overridden in the config (`[advertise]`).
+  - `gen` = a fingerprint of our branches and snapshot ref. It changes on every
+    new snapshot, commit or branch update, and equal state gives an equal
+    value, so a restart does not make peers fetch for nothing.
+- `watch` re-announces whenever `gen` changes (after snapshots and applies).
+  Peers browse for the service; a changed `gen` is the "I have news" signal
+  and triggers a fetch right away. A peer that announces itself is otherwise
+  only fetched every 5 minutes, as a safety net for lost UDP packets. On
+  Ctrl+C, `watch` withdraws its announcement so peers forget it at once.
+- After every local snapshot attempt, peers whose work is waiting (both
+  changed, staged changes, ...) are re-checked against what was already
+  fetched. Resolving on our side (dropping an edit, unstaging) then takes
+  effect within seconds, even if the peer has nothing new to announce.
+- The ssh URL is built from the announcement's `user` and `path` and the
+  address mDNS resolved (IPv4 preferred, never loopback or link-local), not
+  from anything the TXT record claims about addresses.
+- **Fallback / mix:** peers listed in the config are always used too, for
+  networks that block multicast (some corporate Wi-Fi). Their URL wins over an
+  announced one; they are polled every poll interval unless they announce.
+  `discovery = "static"` turns mDNS off entirely.
+- `gitsync discover` lists the peers it hears for a few seconds; `gitsync
+  fetch` also listens for 2 seconds before fetching.
 
-Security note: mDNS is only used to *find* peers. All data moves over ssh, so a
-fake announcement can at most cause a failed ssh connection.
+**Security:** mDNS is only used to *find* peers; all data moves over ssh.
+Announcements are untrusted: machine names must be valid ref components and
+not ours, user names are limited to `[A-Za-z0-9._-]` (no leading `-`), paths
+must be absolute without control characters. For discovered peers, ssh checks
+the host key under a fixed name, `HostKeyAlias=gitsync-<peer>`, instead of
+the IP address. So a peer whose IP changes (DHCP) needs no new trust, and a
+fake announcement pointing somewhere else fails host key verification. The
+first time, the user accepts the key by hand (`gitsync discover` prints the
+exact `ssh -o HostKeyAlias=...` command). This is skipped if the user set
+their own `GIT_SSH_COMMAND` or `core.sshCommand`.
+
+**Windows:** the Windows firewall lets `gitsync.exe` send announcements but not
+receive them on a *Public* network until an inbound rule allows UDP 5353
+(the built-in mDNS rule only covers Windows' own DNS service).
 
 ## 5. Shipping changes between machines
 
@@ -200,6 +233,12 @@ machine_id = "laptop"         # default: hostname
 poll_interval_secs = 30
 debounce_ms = 1000
 discovery = "mdns"            # or "static"
+
+[advertise]                   # optional: how peers reach this machine
+user = "rafael"               # default: current user
+path = "/home/rafael/code/myproj"  # default: the repo folder
+port = 22
+
 [[peers]]                     # optional static peers
 name = "desktop"
 url = "ssh://rafael@192.168.1.20/home/rafael/code/myproj"
@@ -212,6 +251,7 @@ url = "ssh://rafael@192.168.1.20/home/rafael/code/myproj"
 | `clap`                    | Command line parsing (`gitsync watch`, `snapshot` ...) |
 | `notify`, `notify-debouncer-full` | Cross-platform file watching with debouncing   |
 | `mdns-sd`                 | Peer discovery, pure Rust, no system daemon needed     |
+| `ctrlc`                   | Withdraw the mDNS announcement on Ctrl+C               |
 | `serde`, `toml`           | Config file                                            |
 | `anyhow`                  | Simple error handling with context messages            |
 | `tracing`, `tracing-subscriber` | Logging                                          |
@@ -228,6 +268,6 @@ while learning Rust. `git2`/`gix` may replace some `git` calls later for speed.
 2. ✅ Config file and `gitsync status`.
 3. ✅ Fetch from static peers over ssh.
 4. ✅ Apply peer snapshots and fast-forward branches (with the safety rules).
-5. mDNS discovery and `gen` announcements.
+5. ✅ mDNS discovery and `gen` announcements.
 6. Conflict handling and `gitsync resolve`.
 7. Run as a background service (systemd user unit, launchd agent, Windows task).

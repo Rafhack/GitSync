@@ -19,7 +19,12 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
   touched). `gitsync watch` also does this every poll interval, and
   `gitsync status` shows how each peer branch compares with yours.
   A peer's `name` must match the `machine_id` it uses.
-
+- Peers find each other on the LAN by themselves (mDNS, the default
+  `discovery = "mdns"`): `gitsync watch` announces this machine and fetches a
+  peer as soon as it announces news, so no IP addresses go in the config.
+  `gitsync discover` lists the peers it hears. The first time, ssh has to
+  learn each peer's key: `gitsync discover` prints the one-time command.
+  On Windows, allow incoming UDP 5353 for gitsync (DESIGN.md, section 4).
 - Fetched work is applied when it is safe: if you have not changed anything
   since the last sync, the peer's files (and its commits on your branch) are
   taken over; branches that are simply behind are fast-forwarded. If both
@@ -39,11 +44,13 @@ Merging when both machines changed is the next step (DESIGN.md, section 9).
 
 ## Code map
 
-- `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`, `apply`).
+- `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`, `apply`, `discover`).
 - `src/lib.rs`: lists the modules below (so tests can use them).
 - `src/git.rs`: small wrapper that runs the `git` program.
 - `src/snapshot.rs`: turns uncommitted work into a snapshot commit.
-- `src/watch.rs`: file watcher + polling loop, plus a thread fetching and applying peers.
+- `src/watch.rs`: the daemon: file watcher + polling loop, mDNS, and a thread
+  fetching and applying peers.
+- `src/discovery.rs`: mDNS announcements and finding peers on the LAN.
 - `src/fetch.rs`: fetches a peer's branches and snapshots.
 - `src/apply.rs`: decides whether a peer's work is newer and applies it.
 - `src/config.rs`: reads and checks `.git/gitsync.toml`.
