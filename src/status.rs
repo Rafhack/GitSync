@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::apply::{plan, Plan};
 use crate::config::{Config, Discovery};
-use crate::fetch::peer_heads_prefix;
+use crate::fetch::{fetched_peer_names, peer_heads_prefix};
 use crate::git::Git;
 use crate::snapshot::{has_unsaved_changes, wip_ref};
 
@@ -28,11 +28,20 @@ pub struct Status {
     pub unsaved_changes: bool,
     /// Snapshots from other machines found in this repo, by machine id.
     pub other_snapshots: Vec<(String, SnapshotInfo)>,
-    /// Fetched branches of each configured peer, in config order.
-    /// Empty for a peer that was never fetched.
-    pub peer_branches: Vec<Vec<PeerBranch>>,
-    /// What would happen with each configured peer's snapshot, in config order.
-    pub peer_plans: Vec<Plan>,
+    /// Peers: the configured ones first, then any found on the LAN earlier.
+    pub peers: Vec<PeerStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerStatus {
+    pub name: String,
+    /// From the config; `None` for a peer found on the LAN (its address is
+    /// only known while `gitsync watch` hears it).
+    pub url: Option<String>,
+    /// Fetched branches; empty if never fetched.
+    pub branches: Vec<PeerBranch>,
+    /// What would happen with the peer's snapshot.
+    pub plan: Plan,
 }
 
 /// A branch fetched from a peer, compared with our branch of the same name.
@@ -91,21 +100,30 @@ impl Status {
             }
         }
 
-        let peer_branches = config
+        let mut names: Vec<(String, Option<String>)> = config
             .peers
             .iter()
-            .map(|peer| peer_branches(git, &peer.name))
-            .collect::<Result<_>>()?;
-
-        let peer_plans = config
-            .peers
-            .iter()
-            .map(|peer| plan(git, machine_id, &peer.name))
+            .map(|peer| (peer.name.clone(), Some(peer.url.clone())))
+            .collect();
+        for name in fetched_peer_names(git)? {
+            if name != machine_id && !names.iter().any(|(n, _)| *n == name) {
+                names.push((name, None));
+            }
+        }
+        let peers = names
+            .into_iter()
+            .map(|(name, url)| {
+                Ok(PeerStatus {
+                    branches: peer_branches(git, &name)?,
+                    plan: plan(git, machine_id, &name)?,
+                    name,
+                    url,
+                })
+            })
             .collect::<Result<_>>()?;
 
         Ok(Self {
-            peer_branches,
-            peer_plans,
+            peers,
             machine_id: machine_id.to_string(),
             config_found: config_path.exists(),
             config_path,
@@ -225,22 +243,27 @@ impl fmt::Display for Status {
         }
 
         let discovery = match self.config.discovery {
-            Discovery::Mdns => "mdns (automatic discovery is not built yet)",
-            Discovery::Static => "static",
+            Discovery::Mdns => {
+                "mdns (peers on the LAN find each other; `gitsync discover` lists them)"
+            }
+            Discovery::Static => "static (only the peers listed in the config)",
         };
         writeln!(f, "discovery {discovery}")?;
-        if self.config.peers.is_empty() {
-            writeln!(f, "peers     none listed")?;
+        if self.peers.is_empty() {
+            writeln!(f, "peers     none yet")?;
         } else {
             writeln!(f, "peers")?;
-            let peers = self.config.peers.iter().zip(&self.peer_branches);
-            for ((peer, branches), plan) in peers.zip(&self.peer_plans) {
-                writeln!(f, "  {}  {}", peer.name, peer.url)?;
-                writeln!(f, "    sync: {plan}")?;
-                if branches.is_empty() {
+            for peer in &self.peers {
+                let url = peer
+                    .url
+                    .as_deref()
+                    .unwrap_or("(not in the config; found on the LAN earlier)");
+                writeln!(f, "  {}  {url}", peer.name)?;
+                writeln!(f, "    sync: {}", peer.plan)?;
+                if peer.branches.is_empty() {
                     writeln!(f, "    (not fetched yet; run `gitsync fetch`)")?;
                 }
-                for branch in branches {
+                for branch in &peer.branches {
                     writeln!(
                         f,
                         "    {}  {}  {}",

@@ -134,7 +134,8 @@ fn status_compares_peer_branches_with_ours() {
     let status = Status::collect(&laptop, "laptop", config).unwrap();
 
     let relation = |name: &str| {
-        status.peer_branches[0]
+        status.peers[0]
+            .branches
             .iter()
             .find(|b| b.name == name)
             .unwrap_or_else(|| panic!("no peer branch {name}"))

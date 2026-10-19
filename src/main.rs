@@ -1,11 +1,13 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
 use gitsync::apply::{sync_peer, Plan};
-use gitsync::config::{Config, Peer};
-use gitsync::fetch::fetch_peer;
+use gitsync::config::{Config, Discovery, Peer};
+use gitsync::discovery::{Announcement, Found, Mdns, PeerEvent};
+use gitsync::fetch::{fetch_peer, fetched_peer_names, ssh_target};
 use gitsync::git::Git;
 use gitsync::snapshot::{self, Outcome};
 use gitsync::status::Status;
@@ -46,9 +48,10 @@ enum Command {
     },
     /// Show this machine's snapshot, settings and known peers.
     Status,
-    /// Fetch branches and snapshots from the peers in the config (or one peer).
+    /// Fetch branches and snapshots from the peers in the config and, with
+    /// mDNS discovery, the ones on the LAN (or just one peer).
     Fetch {
-        /// Only this peer (its `name` in the config).
+        /// Only this peer (its name).
         peer: Option<String>,
     },
     /// Apply what was fetched, when safe: the peer's snapshot to your files,
@@ -56,6 +59,12 @@ enum Command {
     Apply {
         /// Only this peer (its `name` in the config).
         peer: Option<String>,
+    },
+    /// List the peers for this repo announcing themselves on the LAN (mDNS).
+    Discover {
+        /// How long to listen.
+        #[arg(long, default_value_t = 3)]
+        secs: u64,
     },
 }
 
@@ -94,8 +103,9 @@ fn main() -> Result<()> {
             Outcome::Unchanged => println!("no changes since last snapshot"),
         },
         Command::Watch { .. } => watch::watch(&git, &machine_id, &config)?,
-        Command::Fetch { peer } => fetch(&git, &config, peer.as_deref())?,
+        Command::Fetch { peer } => fetch(&git, &machine_id, &config, peer.as_deref())?,
         Command::Apply { peer } => apply(&git, &machine_id, &config, peer.as_deref())?,
+        Command::Discover { secs } => discover(&git, &machine_id, &config, secs)?,
         Command::Status => print!("{}", Status::collect(&git, &machine_id, config)?),
     }
     Ok(())
@@ -103,10 +113,19 @@ fn main() -> Result<()> {
 
 /// `gitsync fetch`: fetch every configured peer (or one), print what changed.
 /// Keeps going if one peer fails, but exits with an error at the end.
-fn fetch(git: &Git, config: &Config, only: Option<&str>) -> Result<()> {
-    let peers = select_peers(config, only)?;
+fn fetch(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Result<()> {
+    let mut peers = config.peers.clone();
+    if config.discovery == Discovery::Mdns {
+        for found in listen(git, machine_id, config, Duration::from_secs(2))? {
+            // A configured peer's address wins over an announced one.
+            if !peers.iter().any(|p| p.name == found.peer.name) {
+                peers.push(found.peer);
+            }
+        }
+    }
+    let peers = select(peers, only)?;
     let mut failed = 0;
-    for peer in peers {
+    for peer in &peers {
         match fetch_peer(git, peer) {
             Ok(report) => {
                 if report.changes.is_empty() {
@@ -139,9 +158,16 @@ fn fetch(git: &Git, config: &Config, only: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// `gitsync apply`: apply what was already fetched, peer by peer.
+/// `gitsync apply`: apply what was already fetched, peer by peer: the
+/// configured peers and any found on the LAN and fetched before.
 fn apply(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Result<()> {
-    for peer in select_peers(config, only)? {
+    let mut peers = config.peers.clone();
+    for name in fetched_peer_names(git)? {
+        if name != machine_id && !peers.iter().any(|p| p.name == name) {
+            peers.push(Peer::new(name, ""));
+        }
+    }
+    for peer in select(peers, only)? {
         let report = sync_peer(git, machine_id, &peer.name)?;
         match &report.plan {
             Some(Plan::Apply { .. }) => {
@@ -165,18 +191,77 @@ fn apply(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Re
     Ok(())
 }
 
-/// The configured peers, or just the one named `only`.
-fn select_peers<'a>(config: &'a Config, only: Option<&str>) -> Result<Vec<&'a Peer>> {
-    let peers: Vec<_> = config
-        .peers
-        .iter()
+/// All `peers`, or just the one named `only`.
+fn select(peers: Vec<Peer>, only: Option<&str>) -> Result<Vec<Peer>> {
+    let peers: Vec<_> = peers
+        .into_iter()
         .filter(|peer| only.is_none_or(|name| peer.name == name))
         .collect();
     if peers.is_empty() {
         match only {
-            Some(name) => bail!("no peer named {name:?} in the config"),
-            None => bail!("no peers in the config; add [[peers]] to .git/gitsync.toml"),
+            Some(name) => bail!("no peer named {name:?} (configured or found on the LAN)"),
+            None => bail!(
+                "no peers yet; with discovery = \"mdns\" they are found while \
+                 `gitsync watch` runs on them, or list them as [[peers]] in .git/gitsync.toml"
+            ),
         }
     }
     Ok(peers)
+}
+
+/// Peers for this repo announcing themselves on the LAN, heard within `wait`.
+fn listen(git: &Git, machine_id: &str, config: &Config, wait: Duration) -> Result<Vec<Found>> {
+    let Some(ours) = Announcement::for_repo(git, machine_id, config)? else {
+        bail!("this repo has no commits yet, so it has no id peers could match");
+    };
+    let mdns = Mdns::start()?;
+    let events = mdns.browse(&ours.repo, machine_id)?;
+    let deadline = Instant::now() + wait;
+    let mut found: Vec<Found> = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match events.recv_timeout(left) {
+            Ok(PeerEvent::Found(peer)) => {
+                found.retain(|f| f.peer.name != peer.peer.name);
+                found.push(peer);
+            }
+            Ok(PeerEvent::Lost(name)) => found.retain(|f| f.peer.name != name),
+            Err(_) => break,
+        }
+    }
+    found.sort_by(|a, b| a.peer.name.cmp(&b.peer.name));
+    Ok(found)
+}
+
+/// `gitsync discover`: who is out there, and is ssh ready to reach them?
+fn discover(git: &Git, machine_id: &str, config: &Config, secs: u64) -> Result<()> {
+    let found = listen(git, machine_id, config, Duration::from_secs(secs))?;
+    if found.is_empty() {
+        println!("no peers for this repo found on the LAN within {secs}s");
+        println!("(is `gitsync watch` running on them, with discovery = \"mdns\"?)");
+        return Ok(());
+    }
+    for f in &found {
+        println!("{}  {}  (gen {})", f.peer.name, f.peer.url, f.gen);
+        let alias = f.peer.host_key_alias.as_deref().unwrap_or_default();
+        if !host_key_known(alias) {
+            let target = f
+                .peer
+                .url
+                .strip_prefix("ssh://")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or_default();
+            println!("  ssh does not know this peer yet; connect once by hand and accept its key:");
+            println!("  ssh -o HostKeyAlias={alias} {}", ssh_target(target));
+        }
+    }
+    Ok(())
+}
+
+/// True if `~/.ssh/known_hosts` has a key filed under `name`.
+fn host_key_known(name: &str) -> bool {
+    std::process::Command::new("ssh-keygen")
+        .args(["-F", name])
+        .output()
+        .map(|out| out.status.success() && !out.stdout.is_empty())
+        .unwrap_or(false)
 }
