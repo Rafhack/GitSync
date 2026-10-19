@@ -27,12 +27,17 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
   On Windows, allow incoming UDP 5353 for gitsync (DESIGN.md, section 4).
 - Fetched work is applied when it is safe: if you have not changed anything
   since the last sync, the peer's files (and its commits on your branch) are
-  taken over; branches that are simply behind are fast-forwarded. If both
-  machines changed, nothing is touched and `gitsync status` says so.
+  taken over; branches that are simply behind are fast-forwarded.
   `gitsync watch` does this automatically; `gitsync apply` does it once.
   See DESIGN.md, section 6.
+- When both machines changed, their work is merged if they changed different
+  lines (or different files). If they changed the same lines, or one deleted
+  a file the other changed, nothing is touched: `gitsync status` and
+  `gitsync resolve` list the files, and `gitsync resolve --take <peer>` or
+  `gitsync resolve --keep-mine` settles it (only the conflicting lines follow
+  the side you pick; all other changes from both sides are kept).
 
-Merging when both machines changed is the next step (DESIGN.md, section 9).
+Running as a background service is the next step (DESIGN.md, section 9).
 
 ## Try it
 
@@ -44,7 +49,8 @@ Merging when both machines changed is the next step (DESIGN.md, section 9).
 
 ## Code map
 
-- `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`, `apply`, `discover`).
+- `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`, `apply`, `resolve`,
+  `discover`).
 - `src/lib.rs`: lists the modules below (so tests can use them).
 - `src/git.rs`: small wrapper that runs the `git` program.
 - `src/snapshot.rs`: turns uncommitted work into a snapshot commit.
@@ -52,7 +58,8 @@ Merging when both machines changed is the next step (DESIGN.md, section 9).
   fetching and applying peers.
 - `src/discovery.rs`: mDNS announcements and finding peers on the LAN.
 - `src/fetch.rs`: fetches a peer's branches and snapshots.
-- `src/apply.rs`: decides whether a peer's work is newer and applies it.
+- `src/apply.rs`: decides whether a peer's work is newer, applies or merges
+  it, and settles conflicts.
 - `src/config.rs`: reads and checks `.git/gitsync.toml`.
 - `src/status.rs`: gathers and prints `gitsync status`.
 - `tests/`: tests that create throwaway repos (`common/` has the shared helpers).
