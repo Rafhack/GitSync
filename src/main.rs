@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 use gitsync::apply::{sync_peer, Plan};
 use gitsync::config::{Config, Discovery, Peer};
-use gitsync::discovery::{Announcement, Found, Mdns, PeerEvent};
+use gitsync::discovery::{ipv6_note, Announcement, Found, Mdns, PeerEvent};
 use gitsync::fetch::{fetch_peer, fetched_peer_names, ssh_target};
 use gitsync::git::Git;
 use gitsync::snapshot::{self, Outcome};
@@ -241,7 +241,13 @@ fn discover(git: &Git, machine_id: &str, config: &Config, secs: u64) -> Result<(
         return Ok(());
     }
     for f in &found {
-        println!("{}  {}  (gen {})", f.peer.name, f.peer.url, f.gen);
+        println!(
+            "{}  {}  (gen {}){}",
+            f.peer.name,
+            f.peer.url,
+            f.gen,
+            ipv6_note(&f.peer.url)
+        );
         let alias = f.peer.host_key_alias.as_deref().unwrap_or_default();
         if !host_key_known(alias) {
             let target = f

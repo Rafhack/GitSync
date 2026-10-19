@@ -111,7 +111,16 @@ the `mdns-sd` crate, which is pure Rust and works on all three OSes.
   effect within seconds, even if the peer has nothing new to announce.
 - The ssh URL is built from the announcement's `user` and `path` and the
   address mDNS resolved (IPv4 preferred, never loopback or link-local), not
-  from anything the TXT record claims about addresses.
+  from anything the TXT record claims about addresses. A peer heard with only
+  IPv6 is held back 1.5 s for its IPv4 address, and switches to IPv4 as soon
+  as one arrives later.
+- **IPv6 fallback:** mDNS sends each address family in its own packet, and
+  some Wi-Fi networks lose the IPv4 one (measured: a Windows laptop on
+  battery got only the IPv6 answer from Linux in 10 of 10 tries, while the
+  other direction always got IPv4). Waiting longer does not help: the packet
+  never arrives. The IPv6 address works for ssh just as well (the host key is
+  checked by alias, not by address), so gitsync uses it and labels it
+  "(IPv6)" in `discover` and the `watch` log.
 - **Fallback / mix:** peers listed in the config are always used too, for
   networks that block multicast (some corporate Wi-Fi). Their URL wins over an
   announced one; they are polled every poll interval unless they announce.

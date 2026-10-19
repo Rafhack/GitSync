@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::apply::sync_peer;
 use crate::config::{Config, Discovery, Peer};
-use crate::discovery::{Announcement, Mdns, PeerEvent};
+use crate::discovery::{ipv6_note, Announcement, Mdns, PeerEvent};
 use crate::fetch::fetch_peer;
 use crate::git::Git;
 use crate::snapshot::{snapshot, Outcome};
@@ -333,7 +333,8 @@ impl PeerLoop {
                 match self.peers.get_mut(&name) {
                     Some(tracked) => {
                         if !tracked.is_static && tracked.peer.url != found.peer.url {
-                            info!("peer {name} moved to {}", found.peer.url);
+                            let note = ipv6_note(&found.peer.url);
+                            info!("peer {name} moved to {}{note}", found.peer.url);
                             tracked.peer = found.peer;
                         }
                         if !tracked.announced {
@@ -346,7 +347,8 @@ impl PeerLoop {
                         }
                     }
                     None => {
-                        info!("found peer {name} on the LAN ({})", found.peer.url);
+                        let note = ipv6_note(&found.peer.url);
+                        info!("found peer {name} on the LAN ({}){note}", found.peer.url);
                         self.peers.insert(
                             name,
                             Tracked {

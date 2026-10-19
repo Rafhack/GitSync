@@ -160,6 +160,17 @@ pub fn parse(
     })
 }
 
+/// A note to show next to a discovered peer's URL when it uses IPv6. IPv4 is
+/// preferred, but some networks drop the IPv4 half of mDNS answers (Wi-Fi
+/// power saving on laptops, for example), and the IPv6 address works too.
+pub fn ipv6_note(url: &str) -> &'static str {
+    if url.contains("@[") {
+        " (IPv6: the IPv4 answer did not arrive; this address works too)"
+    } else {
+        ""
+    }
+}
+
 /// The name ssh files a discovered peer's host key under.
 pub fn host_key_alias(peer: &str) -> String {
     format!("gitsync-{peer}")
@@ -555,6 +566,12 @@ mod tests {
             v6.peer.url,
             "ssh://rafael@[2001:db8::5]:2222/c/Users/rafael/My Repos/demo"
         );
+    }
+
+    #[test]
+    fn labels_ipv6_urls() {
+        assert_eq!(ipv6_note("ssh://me@10.0.0.9/x"), "");
+        assert!(ipv6_note("ssh://me@[2001:db8::5]/x").contains("IPv6"));
     }
 
     #[test]
