@@ -28,6 +28,22 @@ pub struct Config {
     pub discovery: Discovery,
     /// Peers listed by hand (always used, whatever `discovery` says).
     pub peers: Vec<Peer>,
+    /// How peers should reach this machine, announced over mDNS.
+    pub advertise: Advertise,
+}
+
+/// Overrides for what this machine announces (DESIGN.md §4). Each field
+/// defaults to something sensible, so the whole table is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Advertise {
+    /// ssh user peers log in as (default: the current user).
+    pub user: Option<String>,
+    /// Repo path in the ssh URL (default: the repo's folder; on Windows in
+    /// Git Bash form, `/c/Users/...`).
+    pub path: Option<String>,
+    /// ssh port (default: 22).
+    pub port: Option<u16>,
 }
 
 impl Default for Config {
@@ -38,6 +54,7 @@ impl Default for Config {
             debounce_ms: 1000,
             discovery: Discovery::default(),
             peers: Vec::new(),
+            advertise: Advertise::default(),
         }
     }
 }
@@ -59,6 +76,22 @@ pub struct Peer {
     pub name: String,
     /// Where to fetch from, e.g. `ssh://rafael@192.168.1.20/home/rafael/code/myproj`.
     pub url: String,
+    /// For peers found over mDNS: ssh checks the host key under this name
+    /// instead of the IP, so a new IP needs no new trust and another host
+    /// cannot pose as this peer. Never set from the config file.
+    #[serde(skip)]
+    pub host_key_alias: Option<String>,
+}
+
+impl Peer {
+    /// A peer listed by hand.
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            url: url.into(),
+            host_key_alias: None,
+        }
+    }
 }
 
 impl Config {
@@ -102,6 +135,12 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if let Some(id) = &self.machine_id {
             validate_machine_id(id)?;
+        }
+        if let Some(user) = &self.advertise.user {
+            crate::discovery::validate_user(user).context("[advertise] user")?;
+        }
+        if let Some(path) = &self.advertise.path {
+            crate::discovery::validate_path(path).context("[advertise] path")?;
         }
         if self.poll_interval_secs == 0 {
             bail!("poll_interval_secs must be at least 1");
@@ -151,6 +190,23 @@ mod tests {
         assert_eq!(config.debounce_ms, 500);
         assert_eq!(config.discovery, Discovery::Static);
         assert_eq!(config.peers[0].name, "desktop");
+    }
+
+    #[test]
+    fn parses_advertise_overrides() {
+        let config = Config::parse(
+            "[advertise]\nuser = \"rafael\"\npath = \"/c/Users/rafael/My Repos/x\"\nport = 2222\n",
+        )
+        .unwrap();
+        assert_eq!(config.advertise.user.as_deref(), Some("rafael"));
+        assert_eq!(config.advertise.port, Some(2222));
+        for bad in [
+            "[advertise]\nuser = \"-oProxyCommand=x\"",
+            "[advertise]\npath = \"relative\"",
+            "[advertise]\nhost = \"x\"",
+        ] {
+            assert!(Config::parse(bad).is_err(), "accepted: {bad}");
+        }
     }
 
     #[test]

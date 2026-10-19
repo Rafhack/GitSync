@@ -11,10 +11,7 @@ use gitsync::snapshot::snapshot;
 use gitsync::status::{Relation, Status};
 
 fn peer(dir: &tempfile::TempDir) -> Peer {
-    Peer {
-        name: "desktop".into(),
-        url: dir.path().to_str().unwrap().into(),
-    }
+    Peer::new("desktop", dir.path().to_str().unwrap())
 }
 
 fn rev(git: &Git, name: &str) -> Option<String> {
@@ -95,10 +92,7 @@ fn only_takes_the_peers_own_snapshot() {
 #[test]
 fn unreachable_peer_is_an_error_naming_the_peer() {
     let (_dir, laptop) = repo();
-    let gone = Peer {
-        name: "desktop".into(),
-        url: "/nonexistent/gitsync/peer".into(),
-    };
+    let gone = Peer::new("desktop", "/nonexistent/gitsync/peer");
 
     let err = format!("{:#}", fetch_peer(&laptop, &gone).unwrap_err());
 

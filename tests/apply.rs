@@ -42,10 +42,7 @@ impl Machine {
         sync_peer(&self.git, self.id, other.id).unwrap()
     }
     fn fetch(&self, other: &Machine) {
-        let peer = Peer {
-            name: other.id.into(),
-            url: other.path().to_str().unwrap().into(),
-        };
+        let peer = Peer::new(other.id, other.path().to_str().unwrap());
         fetch_peer(&self.git, &peer).unwrap();
     }
     fn rev(&self, name: &str) -> Option<String> {

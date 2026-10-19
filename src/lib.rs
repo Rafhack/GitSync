@@ -2,6 +2,7 @@
 
 pub mod apply;
 pub mod config;
+pub mod discovery;
 pub mod fetch;
 pub mod git;
 pub mod snapshot;

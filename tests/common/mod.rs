@@ -25,7 +25,10 @@ pub fn repo() -> (TempDir, Git) {
     write(dir.path(), "a.txt", "a\n");
     write(dir.path(), "b.txt", "b\n");
     git.run(&["add", "."]).unwrap();
-    git.run(&["commit", "-q", "-m", "initial"]).unwrap();
+    // The path makes the first commit (the repo id peers match on) unique,
+    // even for repos created in the same second by tests running in parallel.
+    let message = format!("initial {}", dir.path().display());
+    git.run(&["commit", "-q", "-m", &message]).unwrap();
     (dir, git)
 }
 
