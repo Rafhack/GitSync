@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 use common::{clone_of, commit, repo, write};
-use gitsync::apply::{base_ref, execute, plan, sync_peer, Plan};
+use gitsync::apply::{base_ref, execute, plan, resolve, sync_peer, Plan, Side};
 use gitsync::config::Peer;
 use gitsync::fetch::fetch_peer;
 use gitsync::git::Git;
@@ -144,36 +144,316 @@ fn keeps_syncing_back_and_forth() {
 }
 
 #[test]
-fn local_changes_are_never_overwritten() {
+fn ours_newer_when_only_we_changed() {
     let (laptop, desktop) = pair();
     laptop.write("a.txt", "laptop edit\n");
     laptop.snap();
 
-    // Peer unchanged: ours is newer.
     let report = laptop.sync_from(&desktop);
     assert_eq!(report.plan, Some(Plan::OursNewer));
-
-    // Peer changed too: both changed, nothing is touched on either side.
-    desktop.write("b.txt", "desktop edit\n");
-    desktop.snap();
-    assert_eq!(laptop.sync_from(&desktop).plan, Some(Plan::Diverged));
-    assert_eq!(desktop.sync_from(&laptop).plan, Some(Plan::Diverged));
     assert_eq!(laptop.read("a.txt").as_deref(), Some("laptop edit\n"));
-    assert_eq!(laptop.read("b.txt").as_deref(), Some("b\n"));
-    assert_eq!(desktop.read("a.txt").as_deref(), Some("a\n"));
 }
 
 #[test]
-fn unsnapshotted_local_edit_also_counts_as_a_change() {
+fn changes_to_different_files_are_merged() {
+    let (laptop, desktop) = pair();
+    laptop.write("a.txt", "laptop edit\n");
+    laptop.snap();
+    desktop.write("b.txt", "desktop edit\n");
+    desktop.write("new.txt", "new\n");
+    desktop.snap();
+
+    let report = laptop.sync_from(&desktop);
+    assert!(
+        matches!(report.plan, Some(Plan::Merge { .. })),
+        "{report:?}"
+    );
+    assert_eq!(report.applied_files, ["M b.txt", "A new.txt"]);
+    assert_eq!(laptop.read("a.txt").as_deref(), Some("laptop edit\n"));
+    assert_eq!(laptop.read("b.txt").as_deref(), Some("desktop edit\n"));
+    assert_eq!(laptop.staged(), "");
+
+    // The desktop sees its own work inside the merge and simply takes it.
+    let report = desktop.sync_from(&laptop);
+    assert!(
+        matches!(report.plan, Some(Plan::Apply { .. })),
+        "{report:?}"
+    );
+    assert_eq!(desktop.read("a.txt").as_deref(), Some("laptop edit\n"));
+    assert_eq!(desktop.read("new.txt").as_deref(), Some("new\n"));
+    assert_eq!(laptop.sync_from(&desktop).plan, Some(Plan::InSync));
+}
+
+#[test]
+fn different_lines_of_one_file_are_merged() {
+    let (laptop, desktop) = pair();
+    let text = "1\n2\n3\n4\n5\n6\n7\n8\n";
+    laptop.write("a.txt", text);
+    laptop.snap();
+    desktop.sync_from(&laptop);
+
+    laptop.write("a.txt", &text.replace("1\n", "one\n"));
+    laptop.snap();
+    desktop.write("a.txt", &text.replace("8\n", "eight\n"));
+    desktop.snap();
+
+    let report = laptop.sync_from(&desktop);
+    assert!(
+        matches!(report.plan, Some(Plan::Merge { .. })),
+        "{report:?}"
+    );
+    let both = "one\n2\n3\n4\n5\n6\n7\neight\n";
+    assert_eq!(laptop.read("a.txt").as_deref(), Some(both));
+    desktop.sync_from(&laptop);
+    assert_eq!(desktop.read("a.txt").as_deref(), Some(both));
+}
+
+#[test]
+fn later_edits_merge_on_top_of_the_last_merge() {
+    let (laptop, desktop) = pair();
+    let text = "1\n2\n3\n4\n5\n6\n7\n8\n";
+    laptop.write("a.txt", text);
+    laptop.snap();
+    desktop.sync_from(&laptop);
+
+    laptop.write("a.txt", &text.replace("1\n", "one\n"));
+    laptop.snap();
+    desktop.write("b.txt", "desktop\n");
+    desktop.snap();
+    laptop.sync_from(&desktop); // merge
+    desktop.sync_from(&laptop); // takes the merge
+
+    // The desktop changes the line the laptop changed before; the laptop
+    // changes another file. The base is the merge, so no conflict.
+    let merged = text.replace("1\n", "one\n");
+    desktop.write("a.txt", &merged.replace("one\n", "ONE\n"));
+    desktop.snap();
+    laptop.write("b.txt", "laptop\n");
+    laptop.snap();
+
+    let report = laptop.sync_from(&desktop);
+    assert!(
+        matches!(report.plan, Some(Plan::Merge { .. })),
+        "{report:?}"
+    );
+    assert_eq!(
+        laptop.read("a.txt").as_deref(),
+        Some(merged.replace("one\n", "ONE\n").as_str())
+    );
+    assert_eq!(laptop.read("b.txt").as_deref(), Some("laptop\n"));
+}
+
+#[test]
+fn merging_at_the_same_time_on_both_sides_converges() {
+    let (laptop, desktop) = pair();
+    laptop.write("a.txt", "laptop\n");
+    laptop.snap();
+    desktop.write("b.txt", "desktop\n");
+    desktop.snap();
+    laptop.fetch(&desktop);
+    desktop.fetch(&laptop);
+
+    // Each merges the other's work before hearing about the other's merge.
+    let mut plans = Vec::new();
+    for (me, peer) in [(&laptop, &desktop), (&desktop, &laptop)] {
+        plans.push(sync_peer(&me.git, me.id, peer.id).unwrap().plan);
+    }
+    assert!(
+        plans.iter().all(|p| matches!(p, Some(Plan::Merge { .. }))),
+        "{plans:?}"
+    );
+
+    assert_eq!(laptop.sync_from(&desktop).plan, Some(Plan::InSync));
+    assert_eq!(desktop.sync_from(&laptop).plan, Some(Plan::InSync));
+    for machine in [&laptop, &desktop] {
+        assert_eq!(machine.read("a.txt").as_deref(), Some("laptop\n"));
+        assert_eq!(machine.read("b.txt").as_deref(), Some("desktop\n"));
+    }
+}
+
+#[test]
+fn unsnapshotted_local_edit_is_kept_in_the_merge() {
     let (laptop, desktop) = pair();
     desktop.write("a.txt", "desktop\n");
     desktop.snap();
     laptop.write("b.txt", "typed but not snapshotted yet\n");
 
-    assert_eq!(laptop.sync_from(&desktop).plan, Some(Plan::Diverged));
+    let report = laptop.sync_from(&desktop);
+    assert!(
+        matches!(report.plan, Some(Plan::Merge { .. })),
+        "{report:?}"
+    );
+    assert_eq!(laptop.read("a.txt").as_deref(), Some("desktop\n"));
     assert_eq!(
         laptop.read("b.txt").as_deref(),
         Some("typed but not snapshotted yet\n")
+    );
+}
+
+/// Both machines change line 1 of a.txt; the laptop also changes b.txt and
+/// the desktop c.txt.
+fn conflicting_pair() -> (Machine, Machine) {
+    let (laptop, desktop) = pair();
+    laptop.write("a.txt", "laptop\n");
+    laptop.write("b.txt", "laptop b\n");
+    laptop.snap();
+    desktop.write("a.txt", "desktop\n");
+    desktop.write("c.txt", "desktop c\n");
+    desktop.snap();
+    (laptop, desktop)
+}
+
+#[test]
+fn same_lines_changed_on_both_sides_is_a_conflict() {
+    let (laptop, desktop) = conflicting_pair();
+
+    let conflict = Plan::Conflict {
+        files: vec!["a.txt".to_string()],
+    };
+    assert!(conflict.is_waiting());
+    assert_eq!(laptop.sync_from(&desktop).plan.as_ref(), Some(&conflict));
+    assert_eq!(desktop.sync_from(&laptop).plan.as_ref(), Some(&conflict));
+    // Nothing was touched on either side.
+    assert_eq!(laptop.read("a.txt").as_deref(), Some("laptop\n"));
+    assert_eq!(laptop.read("c.txt"), None);
+    assert_eq!(desktop.read("a.txt").as_deref(), Some("desktop\n"));
+    assert_eq!(desktop.read("b.txt").as_deref(), Some("b\n"));
+}
+
+#[test]
+fn resolve_taking_theirs() {
+    let (laptop, desktop) = conflicting_pair();
+    laptop.fetch(&desktop);
+
+    let report = resolve(&laptop.git, "laptop", "desktop", Side::Theirs).unwrap();
+    assert!(
+        matches!(report.plan, Some(Plan::Merge { .. })),
+        "{report:?}"
+    );
+    assert_eq!(laptop.read("a.txt").as_deref(), Some("desktop\n"));
+    // Changes on only one side are kept.
+    assert_eq!(laptop.read("b.txt").as_deref(), Some("laptop b\n"));
+    assert_eq!(laptop.read("c.txt").as_deref(), Some("desktop c\n"));
+
+    // The desktop takes the result as is: no conflict on its side either.
+    let report = desktop.sync_from(&laptop);
+    assert!(
+        matches!(report.plan, Some(Plan::Apply { .. })),
+        "{report:?}"
+    );
+    assert_eq!(desktop.read("a.txt").as_deref(), Some("desktop\n"));
+    assert_eq!(desktop.read("b.txt").as_deref(), Some("laptop b\n"));
+}
+
+#[test]
+fn resolve_keeping_mine() {
+    let (laptop, desktop) = conflicting_pair();
+    laptop.fetch(&desktop);
+
+    resolve(&laptop.git, "laptop", "desktop", Side::Mine).unwrap();
+    assert_eq!(laptop.read("a.txt").as_deref(), Some("laptop\n"));
+    assert_eq!(laptop.read("c.txt").as_deref(), Some("desktop c\n"));
+    assert_eq!(laptop.sync_from(&desktop).plan, Some(Plan::OursNewer));
+
+    desktop.sync_from(&laptop);
+    assert_eq!(desktop.read("a.txt").as_deref(), Some("laptop\n"));
+    assert_eq!(desktop.read("b.txt").as_deref(), Some("laptop b\n"));
+    assert_eq!(desktop.read("c.txt").as_deref(), Some("desktop c\n"));
+}
+
+#[test]
+fn resolve_when_one_side_deleted_the_file() {
+    for (side, expected) in [(Side::Mine, None), (Side::Theirs, Some("desktop\n"))] {
+        let (laptop, desktop) = pair();
+        fs::remove_file(laptop.path().join("a.txt")).unwrap();
+        laptop.snap();
+        desktop.write("a.txt", "desktop\n");
+        desktop.snap();
+
+        let report = laptop.sync_from(&desktop);
+        assert_eq!(
+            report.plan,
+            Some(Plan::Conflict {
+                files: vec!["a.txt".to_string()]
+            })
+        );
+        resolve(&laptop.git, "laptop", "desktop", side).unwrap();
+        assert_eq!(laptop.read("a.txt").as_deref(), expected, "{side:?}");
+    }
+}
+
+#[test]
+fn resolve_needs_a_conflict_and_waits_for_staged_changes() {
+    let (laptop, desktop) = pair();
+    let err = resolve(&laptop.git, "laptop", "desktop", Side::Mine).unwrap_err();
+    assert!(err.to_string().contains("no conflict"), "{err}");
+
+    let (laptop, desktop2) = conflicting_pair();
+    drop(desktop);
+    laptop.fetch(&desktop2);
+    laptop.git.run(&["add", "b.txt"]).unwrap();
+    let err = resolve(&laptop.git, "laptop", "desktop", Side::Theirs).unwrap_err();
+    assert!(err.to_string().contains("staged"), "{err}");
+    assert_eq!(laptop.read("a.txt").as_deref(), Some("laptop\n"));
+}
+
+#[test]
+fn going_back_to_an_earlier_state_still_syncs() {
+    let (laptop, desktop) = pair();
+    desktop.write("a.txt", "edit\n");
+    desktop.snap();
+    laptop.sync_from(&desktop);
+    desktop.sync_from(&laptop);
+
+    // The desktop undoes its edit: a state the laptop had before.
+    desktop.write("a.txt", "a\n");
+    desktop.snap();
+    let report = laptop.sync_from(&desktop);
+    assert!(
+        matches!(report.plan, Some(Plan::Apply { .. })),
+        "{report:?}"
+    );
+    assert_eq!(laptop.read("a.txt").as_deref(), Some("a\n"));
+    assert_eq!(desktop.sync_from(&laptop).plan, Some(Plan::InSync));
+}
+
+#[test]
+fn merge_follows_a_peer_commit() {
+    let (laptop, desktop) = pair();
+    laptop.write("a.txt", "laptop, not committed\n");
+    laptop.snap();
+    let new_head = commit(
+        desktop.path(),
+        &desktop.git,
+        "b.txt",
+        "committed on desktop\n",
+    );
+    desktop.write("c.txt", "desktop, not committed\n");
+    desktop.snap();
+
+    let report = laptop.sync_from(&desktop);
+    assert!(
+        matches!(report.plan, Some(Plan::Merge { .. })),
+        "{report:?}"
+    );
+    assert_eq!(laptop.rev("HEAD"), Some(new_head));
+    assert_eq!(
+        laptop.read("a.txt").as_deref(),
+        Some("laptop, not committed\n")
+    );
+    assert_eq!(
+        laptop.read("b.txt").as_deref(),
+        Some("committed on desktop\n")
+    );
+    assert_eq!(
+        laptop.read("c.txt").as_deref(),
+        Some("desktop, not committed\n")
+    );
+    // Only our own edit (and the peer's uncommitted file) show as changes.
+    assert_eq!(laptop.staged(), "");
+    assert_eq!(
+        laptop.git.run(&["status", "--porcelain"]).unwrap(),
+        "M a.txt\n?? c.txt" // (output is trimmed)
     );
 }
 
@@ -357,4 +637,34 @@ fn work_travels_through_a_third_machine() {
     // And the desktop, which only saw the laptop's first edit, catches up.
     desktop.sync_from(&laptop);
     assert_eq!(desktop.read("b.txt").as_deref(), Some("from phone\n"));
+}
+
+#[test]
+fn merge_already_made_elsewhere_is_taken_as_is() {
+    let (laptop, desktop) = pair();
+    let (phone_dir, phone_git) = clone_of(laptop.path());
+    let phone = Machine {
+        dir: phone_dir,
+        git: phone_git,
+        id: "phone",
+    };
+    phone.snap();
+
+    // The desktop merges the laptop's edit with its own; the phone has only
+    // the laptop's edit so far.
+    laptop.write("a.txt", "laptop\n");
+    laptop.snap();
+    desktop.write("b.txt", "desktop\n");
+    desktop.snap();
+    desktop.sync_from(&laptop);
+    phone.sync_from(&laptop);
+
+    // The desktop's merge contains everything the phone has: taken as is.
+    let report = phone.sync_from(&desktop);
+    assert!(
+        matches!(report.plan, Some(Plan::Apply { .. })),
+        "{report:?}"
+    );
+    assert_eq!(phone.read("a.txt").as_deref(), Some("laptop\n"));
+    assert_eq!(phone.read("b.txt").as_deref(), Some("desktop\n"));
 }

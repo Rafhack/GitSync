@@ -27,6 +27,15 @@ pub fn wip_ref(machine_id: &str) -> String {
 /// Saves the current working tree (modified, deleted and new non-ignored
 /// files) as a snapshot commit, unless it is identical to the previous one.
 pub fn snapshot(git: &Git, machine_id: &str) -> Result<Outcome> {
+    snapshot_including(git, machine_id, &[])
+}
+
+/// Like [`snapshot`], and records that the working tree now includes the
+/// peer snapshots `merged` (taken over, merged, or seen and overruled): they
+/// become extra parents, so peers can tell their work is already in ours.
+/// Creates a snapshot even if the files did not change, unless the previous
+/// snapshot already includes all of `merged`.
+pub fn snapshot_including(git: &Git, machine_id: &str, merged: &[&str]) -> Result<Outcome> {
     let wip = wip_ref(machine_id);
 
     // 1 to 3. The working tree as a git tree object.
@@ -37,33 +46,38 @@ pub fn snapshot(git: &Git, machine_id: &str) -> Result<Outcome> {
     let head_trailer = head.as_deref().unwrap_or("none");
     let prev = git.try_run(&["rev-parse", "--verify", "-q", &wip])?;
     if let Some(prev) = &prev {
-        if is_same_snapshot(git, prev, &tree, head_trailer)? {
+        let mut known = true;
+        for commit in merged {
+            known &= git
+                .try_run(&["merge-base", "--is-ancestor", commit, prev])?
+                .is_some();
+        }
+        if known && is_same_snapshot(git, prev, &tree, head_trailer)? {
             return Ok(Outcome::Unchanged);
         }
     }
 
-    // 5. Create the snapshot commit. Parents: previous snapshot, then HEAD.
+    // 5. Create the snapshot commit. Parents: previous snapshot, HEAD, then
+    //    the included peer snapshots.
     let branch = git
         .try_run(&["symbolic-ref", "--short", "-q", "HEAD"])?
         .unwrap_or_else(|| "(detached)".to_string());
-    let message = format!(
+    let mut message = format!(
         "gitsync snapshot\n\n\
          gitsync-machine: {machine_id}\n\
          gitsync-branch: {branch}\n\
          gitsync-head: {head_trailer}\n"
     );
-    let mut args = vec!["commit-tree", tree.as_str(), "-m", message.as_str()];
-    for parent in prev.iter().chain(head.iter()) {
-        args.extend(["-p", parent.as_str()]);
+    for commit in merged {
+        message.push_str(&format!("gitsync-merged: {commit}\n"));
     }
-    let email = format!("gitsync@{machine_id}");
-    let identity = [
-        ("GIT_AUTHOR_NAME", "gitsync"),
-        ("GIT_AUTHOR_EMAIL", email.as_str()),
-        ("GIT_COMMITTER_NAME", "gitsync"),
-        ("GIT_COMMITTER_EMAIL", email.as_str()),
-    ];
-    let commit = git.run_env(&args, &identity)?;
+    let parents: Vec<&str> = prev
+        .iter()
+        .chain(head.iter())
+        .map(String::as_str)
+        .chain(merged.iter().copied())
+        .collect();
+    let commit = commit_tree(git, machine_id, &tree, &parents, &message)?;
 
     // 6. Move the ref with compare-and-swap: if another snapshot won the race,
     //    this fails instead of silently dropping that snapshot. An empty old
@@ -78,6 +92,29 @@ pub fn snapshot(git: &Git, machine_id: &str) -> Result<Outcome> {
     ])?;
 
     Ok(Outcome::Created(commit))
+}
+
+/// Creates a commit object (no ref is moved) with gitsync's own identity, so
+/// it works on machines without `user.name` configured.
+pub(crate) fn commit_tree(
+    git: &Git,
+    machine_id: &str,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+) -> Result<String> {
+    let mut args = vec!["commit-tree", tree, "-m", message];
+    for parent in parents {
+        args.extend(["-p", parent]);
+    }
+    let email = format!("gitsync@{machine_id}");
+    let identity = [
+        ("GIT_AUTHOR_NAME", "gitsync"),
+        ("GIT_AUTHOR_EMAIL", email.as_str()),
+        ("GIT_COMMITTER_NAME", "gitsync"),
+        ("GIT_COMMITTER_EMAIL", email.as_str()),
+    ];
+    git.run_env(&args, &identity)
 }
 
 /// True if [`snapshot`] would create a new snapshot right now: the working

@@ -48,6 +48,20 @@ impl Git {
         }
     }
 
+    /// For commands where exit code 1 is an answer, not an error (such as
+    /// `merge-tree`, which exits 1 on conflicts): returns whether it exited
+    /// 0, and the raw, untrimmed stdout.
+    pub fn run_ok_or_1(&self, args: &[&str]) -> Result<(bool, String)> {
+        let output = self.output(args, &[])?;
+        match output.status.code() {
+            Some(code @ (0 | 1)) => Ok((
+                code == 0,
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )),
+            _ => bail!(failure(args, &output)),
+        }
+    }
+
     /// Absolute path of the `.git` directory.
     pub fn git_dir(&self) -> Result<PathBuf> {
         Ok(PathBuf::from(

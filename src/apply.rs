@@ -1,20 +1,28 @@
 //! Applies what was fetched from a peer to this machine: its snapshot to the
 //! working tree, and its branches as fast-forwards. See DESIGN.md §6.
 //!
-//! The rule is: never destroy unsynced local work. A peer's snapshot is only
-//! applied when our working tree has not changed since the last time the two
-//! machines were in sync (the "base"). If both sides changed, nothing is
-//! touched (merging is step 6).
+//! The rule is: never destroy unsynced local work. A peer's snapshot is
+//! applied as is when our working tree has not changed since the last time
+//! the two machines were in sync (the "base"). If both sides changed, the two
+//! are merged when they changed different lines; if they changed the same
+//! lines, nothing is touched until the user settles it (`gitsync resolve`).
 //!
 //! A "state" is what a snapshot captures: the commit HEAD pointed to and the
 //! tree of the working tree. Per peer we remember the base state in
 //! `refs/gitsync-state/<peer>/base` (a namespace peers never fetch).
+//!
+//! Every snapshot taken after applying or merging a peer's work links that
+//! peer's snapshot as an extra parent. So the snapshot graph records whose
+//! work each machine has taken in, and git finds the common base for merges
+//! in it.
 
 use anyhow::{bail, Context, Result};
 
 use crate::fetch::peer_heads_prefix;
 use crate::git::Git;
-use crate::snapshot::{snapshot, wip_ref, working_tree, TempIndex};
+use crate::snapshot::{
+    commit_tree, snapshot, snapshot_including, wip_ref, working_tree, TempIndex,
+};
 
 /// Where the last in-sync state with `peer` is remembered.
 pub fn base_ref(peer: &str) -> String {
@@ -46,10 +54,22 @@ pub enum Plan {
         from: State,
         to: State,
     },
+    /// Both changed since the last sync, in different places: `to` combines
+    /// both, and replaces our state.
+    Merge {
+        /// The peer's snapshot commit.
+        snapshot: String,
+        /// Our branch (moved too if the peer's HEAD is ahead).
+        branch: String,
+        from: State,
+        to: State,
+    },
     /// We changed and the peer did not: nothing to do, they fetch ours.
     OursNewer,
-    /// Both changed since the last sync. Left alone (merging is step 6).
-    Diverged,
+    /// Both changed the same lines (or one side deleted a file the other
+    /// changed). Nothing is applied until `gitsync resolve` settles it.
+    /// `files` are the conflicting paths.
+    Conflict { files: Vec<String> },
     /// The peer is working on another branch; its snapshot is only stored.
     OtherBranch { ours: String, theirs: String },
     /// The peer's snapshot is based on a commit that is not ahead of ours.
@@ -63,7 +83,10 @@ impl Plan {
     pub fn is_waiting(&self) -> bool {
         matches!(
             self,
-            Plan::Diverged | Plan::OtherBranch { .. } | Plan::NotFastForward | Plan::Blocked(_)
+            Plan::Conflict { .. }
+                | Plan::OtherBranch { .. }
+                | Plan::NotFastForward
+                | Plan::Blocked(_)
         )
     }
 }
@@ -75,10 +98,21 @@ impl std::fmt::Display for Plan {
             Plan::InSync => write!(f, "in sync"),
             Plan::Apply { .. } => write!(f, "has newer changes; they will be applied"),
             Plan::OursNewer => write!(f, "your changes are newer; the peer will fetch them"),
-            Plan::Diverged => write!(
+            Plan::Merge { .. } => write!(
                 f,
-                "both sides changed since the last sync; not applied (no merging yet)"
+                "both sides changed different things; they will be merged"
             ),
+            Plan::Conflict { files } => {
+                const SHOWN: usize = 5;
+                let mut list = files[..files.len().min(SHOWN)].join(", ");
+                if files.len() > SHOWN {
+                    list.push_str(&format!(" and {} more", files.len() - SHOWN));
+                }
+                write!(
+                    f,
+                    "conflict: both sides changed {list} in ways that do not merge; not applied (see `gitsync resolve`)"
+                )
+            }
             Plan::OtherBranch { ours, theirs } => {
                 write!(
                     f,
@@ -108,8 +142,20 @@ pub struct SyncReport {
     pub branches: Vec<(String, String, String)>,
 }
 
-/// Decides what to do with `peer`'s latest fetched snapshot. Changes nothing.
+/// Which side wins where both changed the same lines (`gitsync resolve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Mine,
+    Theirs,
+}
+
+/// Decides what to do with `peer`'s latest fetched snapshot. Changes nothing
+/// (it may write git objects, never refs or files).
 pub fn plan(git: &Git, machine_id: &str, peer: &str) -> Result<Plan> {
+    make_plan(git, machine_id, peer, None)
+}
+
+fn make_plan(git: &Git, machine_id: &str, peer: &str, favor: Option<Side>) -> Result<Plan> {
     let Some(snap) = rev(git, &wip_ref(peer))? else {
         return Ok(Plan::NoSnapshot);
     };
@@ -125,17 +171,25 @@ pub fn plan(git: &Git, machine_id: &str, peer: &str) -> Result<Plan> {
         return Ok(Plan::InSync);
     }
 
-    // Who has seen whose work? Snapshot histories answer that without
+    // Who has taken in whose work? The snapshot graph answers that without
     // trusting clocks. Checked in this order so local work wins a tie.
-    if let Some(ours) = rev(git, &wip_ref(machine_id))? {
-        if history_states(git, &ours)?.contains(&theirs) {
-            // We already had the peer's state and moved on.
+    let ours = match rev(git, &wip_ref(machine_id))? {
+        Some(commit) => Some((read_state(git, &commit)?, commit)),
+        None => None,
+    };
+    if let Some((_, ours)) = &ours {
+        if is_ancestor(git, &snap, ours)? {
+            // We already have the peer's latest work.
             return Ok(Plan::OursNewer);
         }
     }
-    let peer_saw_mine = history_states(git, &snap)?.contains(&mine);
+    let peer_has_mine = match &ours {
+        // (Only if we did not change anything since that snapshot.)
+        Some((state, commit)) => *state == mine && is_ancestor(git, commit, &snap)?,
+        None => false,
+    };
 
-    if !peer_saw_mine {
+    let both_changed = !peer_has_mine && {
         // Fall back to the last state both sides had. Without a record, a
         // clean checkout of our HEAD counts as the common starting point.
         let base = match rev(git, &base_ref(peer))? {
@@ -148,16 +202,13 @@ pub fn plan(git: &Git, machine_id: &str, peer: &str) -> Result<Plan> {
                 None => return Ok(Plan::Blocked("this repo has no commits yet".into())),
             },
         };
-        if mine != base {
-            return Ok(if theirs == base {
-                Plan::OursNewer
-            } else {
-                Plan::Diverged
-            });
+        if mine != base && theirs == base {
+            return Ok(Plan::OursNewer);
         }
-    }
+        mine != base
+    };
 
-    // Only the peer changed. Check it is safe to take its state.
+    // Check it is safe to take the peer's work.
     let Some(branch) = current_branch(git)? else {
         return Ok(Plan::Blocked("HEAD is detached".into()));
     };
@@ -170,18 +221,191 @@ pub fn plan(git: &Git, machine_id: &str, peer: &str) -> Result<Plan> {
     let (Some(our_head), Some(their_head)) = (&mine.head, &theirs.head) else {
         return Ok(Plan::NotFastForward);
     };
-    if our_head != their_head && !is_ancestor(git, our_head, their_head)? {
+    // The commit the result is based on: the newer of the two HEADs.
+    let new_head = if our_head == their_head || is_ancestor(git, our_head, their_head)? {
+        their_head.clone()
+    } else if both_changed && is_ancestor(git, their_head, our_head)? {
+        our_head.clone()
+    } else {
         return Ok(Plan::NotFastForward);
-    }
+    };
+
+    let to = if both_changed {
+        // Our state as a commit linked into the snapshot graph: the latest
+        // snapshot if it is current, else a throwaway one on top of it.
+        let ours_commit = match &ours {
+            Some((state, commit)) if *state == mine => commit.clone(),
+            _ => {
+                let parents: Vec<&str> = ours
+                    .iter()
+                    .map(|(_, commit)| commit.as_str())
+                    .chain(head.as_deref())
+                    .collect();
+                commit_tree(
+                    git,
+                    machine_id,
+                    &mine.tree,
+                    &parents,
+                    "gitsync working tree",
+                )?
+            }
+        };
+        match merge(git, peer, &ours_commit, &snap, favor)? {
+            Merged::Clean(tree) => State {
+                head: Some(new_head),
+                tree,
+            },
+            Merged::Conflict(files) => return Ok(Plan::Conflict { files }),
+        }
+    } else {
+        theirs.clone()
+    };
+
     if let Some(reason) = blocked_reason(git)? {
         return Ok(Plan::Blocked(reason));
     }
-    Ok(Plan::Apply {
-        snapshot: snap,
-        branch,
-        from: mine,
-        to: theirs,
+    // A merge that comes out as exactly the peer's state (their work already
+    // contained ours, through a third machine) is just taking theirs.
+    Ok(if both_changed && to != theirs {
+        Plan::Merge {
+            snapshot: snap,
+            branch,
+            from: mine,
+            to,
+        }
+    } else {
+        Plan::Apply {
+            snapshot: snap,
+            branch,
+            from: mine,
+            to,
+        }
     })
+}
+
+/// Settles a conflict with `peer`: merges again, taking `side`'s version
+/// where both changed the same lines (and of whole files where one side
+/// deleted what the other changed), then applies the result like any merge.
+/// Changes on only one side are kept either way.
+pub fn resolve(git: &Git, machine_id: &str, peer: &str, side: Side) -> Result<SyncReport> {
+    let current = plan(git, machine_id, peer)?;
+    if !matches!(current, Plan::Conflict { .. }) {
+        bail!("no conflict with {peer} to resolve ({current})");
+    }
+    let resolved = make_plan(git, machine_id, peer, Some(side))?;
+    // (Taking theirs where we changed nothing else is just applying theirs.)
+    if !matches!(resolved, Plan::Merge { .. } | Plan::Apply { .. }) {
+        bail!("cannot resolve the conflict with {peer} now: {resolved}");
+    }
+    execute(git, machine_id, peer, resolved)
+}
+
+enum Merged {
+    Clean(String),
+    Conflict(Vec<String>),
+}
+
+/// 3-way merge of two snapshot commits with `git merge-tree`. The base is
+/// their common ancestor in the snapshot graph, or the last in-sync state
+/// with `peer` when that is newer (states both sides reached on their own,
+/// like the same edit made twice, are not linked in the graph).
+fn merge(git: &Git, peer: &str, ours: &str, theirs: &str, favor: Option<Side>) -> Result<Merged> {
+    let mut args = vec![
+        "merge-tree",
+        "--write-tree",
+        "-z",
+        "--name-only",
+        "--no-messages",
+    ];
+    let base_arg;
+    if let Some(base) = recorded_base(git, peer, ours, theirs)? {
+        base_arg = format!("--merge-base={base}");
+        args.push(&base_arg);
+    }
+    match favor {
+        Some(Side::Mine) => args.extend(["-X", "ours"]),
+        Some(Side::Theirs) => args.extend(["-X", "theirs"]),
+        None => {}
+    }
+    args.extend([ours, theirs]);
+    let (clean, out) = git.run_ok_or_1(&args)?;
+    // Output: the tree, then the conflicted paths, NUL separated.
+    let mut fields = out.split('\0');
+    let tree = fields.next().unwrap_or_default().trim().to_string();
+    if clean {
+        return Ok(Merged::Clean(tree));
+    }
+    let mut files: Vec<String> = fields
+        .take_while(|field| !field.is_empty())
+        .map(String::from)
+        .collect();
+    files.dedup();
+    Ok(match favor {
+        None => Merged::Conflict(files),
+        // What `-X` cannot settle (a file deleted on one side and changed on
+        // the other, a file against a folder): take that side's version.
+        Some(side) => {
+            let winner = if side == Side::Mine { ours } else { theirs };
+            Merged::Clean(take_versions(git, &tree, &files, winner)?)
+        }
+    })
+}
+
+/// The recorded base with `peer`, if every common ancestor of `ours` and
+/// `theirs` in the snapshot graph is also an ancestor of it.
+fn recorded_base(git: &Git, peer: &str, ours: &str, theirs: &str) -> Result<Option<String>> {
+    let Some(base) = rev(git, &base_ref(peer))? else {
+        return Ok(None);
+    };
+    if let Some(found) = git.try_run(&["merge-base", "--all", ours, theirs])? {
+        for ancestor in found.lines() {
+            if !is_ancestor(git, ancestor, &base)? {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(base))
+}
+
+/// `tree` with each of `paths` replaced by its version in commit `source`
+/// (removed where `source` has none).
+fn take_versions(git: &Git, tree: &str, paths: &[String], source: &str) -> Result<String> {
+    let temp_index = TempIndex::new(&git.git_dir()?);
+    let env = [
+        ("GIT_INDEX_FILE", temp_index.path_str()?),
+        ("GIT_LITERAL_PATHSPECS", "1"),
+    ];
+    git.run_env(&["read-tree", tree], &env)?;
+    for path in paths {
+        git.run_env(
+            &["rm", "--cached", "-r", "-q", "--ignore-unmatch", "--", path],
+            &env,
+        )?;
+        let entries = git.run_env(&["ls-tree", "-r", "-z", source, "--", path], &env)?;
+        for entry in entries.split('\0').filter(|e| !e.is_empty()) {
+            // "<mode> <type> <oid>\t<path>"
+            let Some((info, name)) = entry.split_once('\t') else {
+                continue;
+            };
+            let info: Vec<&str> = info.split(' ').collect();
+            let [mode, _, oid] = info[..] else {
+                continue;
+            };
+            git.run_env(
+                &[
+                    "update-index",
+                    "--add",
+                    "--replace",
+                    "--cacheinfo",
+                    mode,
+                    oid,
+                    name,
+                ],
+                &env,
+            )?;
+        }
+    }
+    git.run_env(&["write-tree"], &env)
 }
 
 /// Brings this repo in line with what was fetched from `peer`: applies its
@@ -209,10 +433,21 @@ pub fn execute(git: &Git, machine_id: &str, peer: &str, plan: Plan) -> Result<Sy
             branch,
             from,
             to,
+        }
+        | Plan::Merge {
+            snapshot: snap,
+            branch,
+            from,
+            to,
         } => {
+            let verb = if matches!(plan, Plan::Merge { .. }) {
+                "merge"
+            } else {
+                "apply"
+            };
             snapshot(git, machine_id)?; // safety copy of what we are replacing
             report.applied_files = changed_files(git, &from.tree, &to.tree)?;
-            apply_state(git, branch, from, to, &format!("gitsync: apply {peer}"))?;
+            apply_state(git, branch, from, to, &format!("gitsync: {verb} {peer}"))?;
             if let (Some(old), Some(new)) = (&from.head, &to.head) {
                 if old != new {
                     report
@@ -221,7 +456,8 @@ pub fn execute(git: &Git, machine_id: &str, peer: &str, plan: Plan) -> Result<Sy
                 }
             }
             git.run(&["update-ref", &base_ref(peer), snap])?;
-            snapshot(git, machine_id)?;
+            // Record that the peer's work is in ours now.
+            snapshot_including(git, machine_id, &[snap.as_str()])?;
         }
         _ => {}
     }
@@ -343,32 +579,6 @@ fn blocked_reason(git: &Git) -> Result<Option<String>> {
 fn is_clean(git: &Git, head: &str) -> Result<bool> {
     let head_tree = git.run(&["rev-parse", &format!("{head}^{{tree}}")])?;
     Ok(working_tree(git)? == head_tree && git.try_run(&["diff", "--cached", "--quiet"])?.is_some())
-}
-
-/// States of the snapshots in `snapshot`'s history, newest first: its chain
-/// of previous snapshots (first parents), up to a limit. Each machine's chain
-/// includes the states it took over from peers, since it snapshots right
-/// after applying.
-fn history_states(git: &Git, snapshot: &str) -> Result<Vec<State>> {
-    let out = git.run(&[
-        "log",
-        "--first-parent",
-        "--max-count=500",
-        "--format=%x01%T%x00%(trailers:key=gitsync-head,valueonly)",
-        snapshot,
-    ])?;
-    Ok(out
-        .split('\x01')
-        .filter_map(|record| {
-            let (tree, head) = record.split_once('\0')?;
-            let head = head.trim();
-            // Real commits (reached past the first snapshot) have no trailer.
-            (!head.is_empty()).then(|| State {
-                head: (head != "none").then(|| head.to_string()),
-                tree: tree.trim().to_string(),
-            })
-        })
-        .collect())
 }
 
 fn read_state(git: &Git, snapshot: &str) -> Result<State> {
