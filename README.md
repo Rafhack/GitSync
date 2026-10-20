@@ -46,9 +46,18 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
 
 All steps of the build plan (DESIGN.md, section 10) are done.
 
+## Download
+
+Ready-made programs for Linux (x86-64 and ARM64, e.g. a Raspberry Pi),
+Windows and macOS (Intel and Apple Silicon) are on the
+[Releases page](https://github.com/Rafhack/GitSync/releases). Unpack it and put
+`gitsync` (`gitsync.exe` on Windows) somewhere on your `PATH`. Every machine
+also needs `git` and an ssh server (DESIGN.md, section 5).
+
 ## Try it
 
 1. Install Rust: https://rustup.rs (one installer, works on Windows, macOS, Linux).
+   Or skip building and use a download (above).
 2. Build: `cargo build --release` (the program ends up in `target/release/gitsync`).
 3. Run the tests: `cargo test`.
 4. In any git repo: `gitsync watch` (Ctrl+C to stop), edit a file, then look at
@@ -74,3 +83,13 @@ All steps of the build plan (DESIGN.md, section 10) are done.
 - `src/config.rs`: reads and checks `.git/gitsync.toml`.
 - `src/status.rs`: gathers and prints `gitsync status`.
 - `tests/`: tests that create throwaway repos (`common/` has the shared helpers).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
