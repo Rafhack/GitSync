@@ -115,6 +115,13 @@ enum ServiceAction {
 }
 
 fn main() -> Result<()> {
+    // Exit quietly when the reader goes away (`gitsync status | head`), like
+    // other command line tools, instead of panicking on a broken pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     let filter = || {

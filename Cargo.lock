@@ -255,6 +255,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "gethostname",
+ "libc",
  "mdns-sd",
  "notify",
  "notify-debouncer-full",
