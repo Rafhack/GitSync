@@ -10,7 +10,9 @@ use crate::apply::{plan, Plan};
 use crate::config::{Config, Discovery};
 use crate::fetch::{fetched_peer_names, peer_heads_prefix};
 use crate::git::Git;
+use crate::service::Service;
 use crate::snapshot::{has_unsaved_changes, wip_ref};
+use crate::watch;
 
 #[derive(Debug, Clone)]
 pub struct Status {
@@ -30,6 +32,8 @@ pub struct Status {
     pub other_snapshots: Vec<(String, SnapshotInfo)>,
     /// Peers: the configured ones first, then any found on the LAN earlier.
     pub peers: Vec<PeerStatus>,
+    /// Whether `gitsync watch` runs, as a service or by hand, in words.
+    pub watcher: String,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +128,7 @@ impl Status {
 
         Ok(Self {
             peers,
+            watcher: watcher(git),
             machine_id: machine_id.to_string(),
             config_found: config_path.exists(),
             config_path,
@@ -134,6 +139,27 @@ impl Status {
             unsaved_changes: has_unsaved_changes(git, machine_id)?,
             other_snapshots,
         })
+    }
+}
+
+fn watcher(git: &Git) -> String {
+    let service = Service::for_repo(git).and_then(|s| Ok((s.state()?, s)));
+    let running = watch::is_running(git).unwrap_or(false);
+    match service {
+        Ok((state, service)) if state.running => {
+            format!("gitsync watch runs in the background ({})", service.name)
+        }
+        Ok((state, _)) if state.installed => format!(
+            "background service installed but not running{}",
+            if running {
+                "; gitsync watch runs in a terminal"
+            } else {
+                " (`gitsync service start`)"
+            }
+        ),
+        _ if running => "gitsync watch runs in a terminal".to_string(),
+        _ => "gitsync watch is not running (`gitsync service install` runs it in the background)"
+            .to_string(),
     }
 }
 
@@ -249,6 +275,7 @@ impl fmt::Display for Status {
             Discovery::Static => "static (only the peers listed in the config)",
         };
         writeln!(f, "discovery {discovery}")?;
+        writeln!(f, "watch     {}", self.watcher)?;
         if self.peers.is_empty() {
             writeln!(f, "peers     none yet")?;
         } else {

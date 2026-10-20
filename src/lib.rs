@@ -7,6 +7,7 @@ pub mod fetch;
 pub mod git;
 pub mod lock;
 pub mod log_file;
+pub mod service;
 pub mod snapshot;
 pub mod status;
 pub mod watch;

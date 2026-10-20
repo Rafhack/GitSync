@@ -12,6 +12,7 @@ use gitsync::discovery::{ipv6_note, Announcement, Found, Mdns, PeerEvent};
 use gitsync::fetch::{fetch_peer, fetched_peer_names, ssh_target};
 use gitsync::git::Git;
 use gitsync::log_file::LogFile;
+use gitsync::service::Service;
 use gitsync::snapshot::{self, Outcome};
 use gitsync::status::Status;
 use gitsync::watch;
@@ -53,6 +54,11 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         log_file: Option<PathBuf>,
     },
+    /// Run `gitsync watch` for this repo in the background, from login on.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Show this machine's snapshot, settings and known peers.
     Status,
     /// Fetch branches and snapshots from the peers in the config and, with
@@ -87,6 +93,27 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Set up the service for this repo and start it (again, if it was
+    /// installed already: picks up a new gitsync program or config).
+    Install,
+    /// Stop the service and remove it.
+    Uninstall,
+    /// Start the installed service.
+    Start,
+    /// Stop the service until `start` or the next login.
+    Stop,
+    /// Is it installed and running, and where is its log.
+    Status,
+    /// What the Windows task runs: keeps `gitsync watch` running.
+    #[command(hide = true)]
+    Run {
+        #[arg(long, value_name = "FILE")]
+        log_file: PathBuf,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -102,6 +129,13 @@ fn main() -> Result<()> {
             .with_env_filter(filter())
             .with_ansi(false)
             .with_writer(Mutex::new(LogFile::open(path)?))
+            .init(),
+        Command::Service {
+            action: ServiceAction::Run { log_file },
+        } => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false)
+            .with_writer(gitsync::service::append_to(log_file.clone()))
             .init(),
         _ => tracing_subscriber::fmt()
             .with_env_filter(filter())
@@ -138,6 +172,7 @@ fn main() -> Result<()> {
         Command::Watch { .. } => watch::watch(&git, &machine_id, &config)?,
         Command::Fetch { peer } => fetch(&git, &machine_id, &config, peer.as_deref())?,
         Command::Apply { peer } => apply(&git, &machine_id, &config, peer.as_deref())?,
+        Command::Service { action } => service(&git, action)?,
         Command::Resolve { take, keep_mine } => {
             resolve(&git, &machine_id, &config, take, keep_mine)?
         }
@@ -221,6 +256,79 @@ fn apply(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Re
                 &old[..12],
                 &new[..12]
             );
+        }
+    }
+    Ok(())
+}
+
+/// `gitsync service ...`
+fn service(git: &Git, action: ServiceAction) -> Result<()> {
+    if let ServiceAction::Run { log_file } = &action {
+        return gitsync::service::supervise(git, log_file);
+    }
+    let service = Service::for_repo(git)?;
+    match action {
+        ServiceAction::Install => {
+            let state = service.state()?;
+            if !state.running && watch::is_running(git)? {
+                bail!(
+                    "gitsync watch is already running for this repo; stop it (Ctrl+C) \
+                     and run this again"
+                );
+            }
+            service.install()?;
+            println!("installed and started {}", service.name);
+            println!(
+                "  runs:  {} {}",
+                service.exe.display(),
+                service.program_args().join(" ")
+            );
+            println!("  from:  {}", service.location()?);
+            println!("  log:   {}", service.log_hint());
+            if let Some(note) = service.linger_note() {
+                println!("  note:  {note}");
+            }
+            println!("it starts again at every login; `gitsync service uninstall` removes it");
+        }
+        ServiceAction::Uninstall => {
+            if !service.state()?.installed {
+                bail!("no gitsync service is installed for this repo");
+            }
+            service.uninstall()?;
+            println!("stopped and removed {}", service.name);
+        }
+        ServiceAction::Start => {
+            if !service.state()?.installed {
+                bail!("no gitsync service is installed for this repo (`gitsync service install`)");
+            }
+            service.start()?;
+            println!("started {}", service.name);
+        }
+        ServiceAction::Stop => {
+            service.stop()?;
+            println!(
+                "stopped {} (it starts again at the next login)",
+                service.name
+            );
+        }
+        ServiceAction::Run { .. } => unreachable!("handled above"),
+        ServiceAction::Status => {
+            let state = service.state()?;
+            let text = match (state.installed, state.running) {
+                (false, _) => "not installed (`gitsync service install` sets it up)",
+                (true, true) => "running",
+                (true, false) => "installed, not running (`gitsync service start`)",
+            };
+            println!("service  {}: {text}", service.name);
+            if state.installed {
+                println!("  from:  {}", service.location()?);
+                println!(
+                    "  runs:  {} {}",
+                    service.exe.display(),
+                    service.program_args().join(" ")
+                );
+                println!("  log:   {}", service.log_hint());
+            }
         }
     }
     Ok(())

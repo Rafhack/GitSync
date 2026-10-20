@@ -72,3 +72,55 @@ fn only_one_watch_per_repo_and_it_can_log_to_a_file() {
     assert!(!is_running(&git).unwrap());
     assert_eq!(running_pid(&git).unwrap(), None);
 }
+
+fn kill(pid: u32) {
+    let status = if cfg!(windows) {
+        Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(Stdio::null())
+            .status()
+    } else {
+        Command::new("kill").args(["-9", &pid.to_string()]).status()
+    };
+    assert!(status.unwrap().success());
+}
+
+#[test]
+fn service_loop_starts_watch_again_when_it_stops() {
+    let (dir, git) = repo();
+    fs::write(
+        dir.path().join(".git/gitsync.toml"),
+        "machine_id = \"tester\"\ndiscovery = \"static\"\n",
+    )
+    .unwrap();
+    let log = dir.path().join(".git/test-logs/service.log");
+
+    let service = gitsync(
+        dir.path(),
+        &["service", "run", "--log-file", log.to_str().unwrap()],
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+    let _service = Running(service);
+    let mut first = None;
+    wait_until(|| {
+        first = running_pid(&git).unwrap();
+        first.is_some()
+    });
+
+    // watch dies; the loop notices, logs it and starts a new one.
+    kill(first.unwrap());
+    let mut second = None;
+    wait_until(|| {
+        second = running_pid(&git).unwrap();
+        second.is_some_and(|pid| Some(pid) != first)
+    });
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(text.contains("starting it again in 10 s"), "{text}");
+
+    // Ending the loop does not end the watch it started: clean up.
+    drop(_service);
+    kill(second.unwrap());
+}
