@@ -149,6 +149,16 @@ their own `GIT_SSH_COMMAND` or `core.sshCommand`.
 receive them on a *Public* network until an inbound rule allows UDP 5353
 (the built-in mDNS rule only covers Windows' own DNS service).
 
+**Windows ssh server:** peers fetch from a Windows machine through its ssh
+server, which starts a shell for every fetch. If `sshd` runs inside the
+user's desktop session (for example as a task with "Run only when user is
+logged on"), each of those shells opens a console window for a moment, so
+windows flash whenever the machine has news. Run `sshd` outside the desktop
+session instead: the OpenSSH service, or a task set to "Run whether user is
+logged on or not". For Azure AD work accounts, where the service and the
+password-less variant ("Do not store password") fail to log on, a task that
+stores the password works. gitsync's own git commands never open windows.
+
 ## 5. Shipping changes between machines
 
 Plain `git fetch` over ssh, run as a child process. For a peer `desktop`:
