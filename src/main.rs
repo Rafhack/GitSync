@@ -1,4 +1,6 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -9,6 +11,7 @@ use gitsync::config::{Config, Discovery, Peer};
 use gitsync::discovery::{ipv6_note, Announcement, Found, Mdns, PeerEvent};
 use gitsync::fetch::{fetch_peer, fetched_peer_names, ssh_target};
 use gitsync::git::Git;
+use gitsync::log_file::LogFile;
 use gitsync::snapshot::{self, Outcome};
 use gitsync::status::Status;
 use gitsync::watch;
@@ -45,6 +48,10 @@ enum Command {
         /// (default: debounce_ms from the config, else 1000).
         #[arg(long)]
         debounce_ms: Option<u64>,
+        /// Write the log to this file instead of the terminal (the background
+        /// service uses this on Windows and macOS).
+        #[arg(long, value_name = "FILE")]
+        log_file: Option<PathBuf>,
     },
     /// Show this machine's snapshot, settings and known peers.
     Status,
@@ -81,14 +88,27 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "gitsync=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "gitsync=info".into())
+    };
+    match &cli.command {
+        Command::Watch {
+            log_file: Some(path),
+            ..
+        } => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(false)
+            .with_writer(Mutex::new(LogFile::open(path)?))
+            .init(),
+        _ => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_ansi(std::io::stdout().is_terminal())
+            .init(),
+    }
+
     let git = Git::new(cli.dir);
 
     // Effective settings: config file, then command line flags on top.
@@ -99,6 +119,7 @@ fn main() -> Result<()> {
     if let Command::Watch {
         poll_secs,
         debounce_ms,
+        ..
     } = &cli.command
     {
         config.poll_interval_secs = poll_secs.unwrap_or(config.poll_interval_secs);

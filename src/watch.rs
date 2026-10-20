@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use tracing::{debug, info, warn};
@@ -19,18 +19,28 @@ use crate::config::{Config, Discovery, Peer};
 use crate::discovery::{ipv6_note, Announcement, Mdns, PeerEvent};
 use crate::fetch::fetch_peer;
 use crate::git::Git;
+use crate::lock::ProcessLock;
 use crate::snapshot::{snapshot, Outcome};
 
 /// How often a peer that announces its news is fetched anyway, in case an
 /// announcement got lost (mDNS runs over UDP).
 const SAFETY_POLL: Duration = Duration::from_secs(300);
 
-/// Runs until the process is stopped (Ctrl+C).
+/// Runs until the process is stopped (Ctrl+C, or SIGTERM from a service
+/// manager).
 pub fn watch(git: &Git, machine_id: &str, config: &Config) -> Result<()> {
     let debounce = Duration::from_millis(config.debounce_ms);
     let poll = Duration::from_secs(config.poll_interval_secs);
     // Canonical paths, so they compare equal to the paths in watcher events.
     let git_dir = git.git_dir()?.canonicalize()?;
+    // One watcher per repo: two would announce the same name on the LAN.
+    let _lock = match ProcessLock::acquire(&git_dir, "watch")? {
+        Some(lock) => lock,
+        None => bail!(
+            "gitsync watch is already running for this repo \
+             (maybe the background service: `gitsync service status`)"
+        ),
+    };
     let workdir = git.workdir().canonicalize()?;
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
     // Snapshots and applies must never interleave: a snapshot of a
@@ -62,8 +72,8 @@ pub fn watch(git: &Git, machine_id: &str, config: &Config) -> Result<()> {
     let presence = start_mdns(git, machine_id, config).map(Arc::new);
     let peer_events = presence.as_ref().and_then(|p| p.browse());
     if let Some(presence) = &presence {
-        // Say goodbye on Ctrl+C, so peers forget us now instead of waiting
-        // for the announcement to expire.
+        // Say goodbye on Ctrl+C or SIGTERM, so peers forget us now instead
+        // of waiting for the announcement to expire.
         let presence = presence.clone();
         let _ = ctrlc::set_handler(move || {
             presence.mdns.goodbye();
@@ -466,6 +476,16 @@ impl PeerLoop {
             Err(err) => warn!("applying changes from {name} failed: {err:#}"),
         }
     }
+}
+
+/// True if a `gitsync watch` is running for this repo right now.
+pub fn is_running(git: &Git) -> Result<bool> {
+    ProcessLock::is_held(&git.git_dir()?, "watch")
+}
+
+/// The process id of the `gitsync watch` running for this repo, if one is.
+pub fn running_pid(git: &Git) -> Result<Option<u32>> {
+    ProcessLock::holder(&git.git_dir()?, "watch")
 }
 
 /// Paths for humans: without Windows' `\\?\` prefix that canonicalize adds.
