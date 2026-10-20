@@ -1,0 +1,98 @@
+# Builds gitsync for each platform and publishes a GitHub release when a
+# version tag is pushed:  git tag v0.1.0 && git push origin v0.1.0
+# The tag must match the version in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: static (musl) programs, so they run on any distribution.
+          # rust-lld links them without a C toolchain for the target.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.linker }}" ]; then
+            var="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
+            export "$var=${{ matrix.linker }}"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check it runs
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: target/${{ matrix.target }}/release/gitsync --version
+
+      - name: Package
+        shell: bash
+        run: |
+          name="gitsync-$VERSION-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "../target/${{ matrix.target }}/release/gitsync.exe" "$name/"
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            cp "../target/${{ matrix.target }}/release/gitsync" "$name/"
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -r "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "gitsync $GITHUB_REF_NAME" \
+            --generate-notes
