@@ -37,7 +37,14 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
   `gitsync resolve --keep-mine` settles it (only the conflicting lines follow
   the side you pick; all other changes from both sides are kept).
 
-Running as a background service is the next step (DESIGN.md, section 9).
+- `gitsync service install` runs `gitsync watch` for the repo in the
+  background, from login on, and restarts it if it crashes: a systemd user
+  service on Linux, a launchd agent on macOS (not tested yet), a hidden
+  Task Scheduler task on Windows. `gitsync service status` shows where its
+  log is; `uninstall`, `start` and `stop` do what they say. See DESIGN.md,
+  section 9.
+
+All steps of the build plan (DESIGN.md, section 10) are done.
 
 ## Try it
 
@@ -50,12 +57,16 @@ Running as a background service is the next step (DESIGN.md, section 9).
 ## Code map
 
 - `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`, `apply`, `resolve`,
-  `discover`).
+  `discover`, `service`).
 - `src/lib.rs`: lists the modules below (so tests can use them).
 - `src/git.rs`: small wrapper that runs the `git` program.
 - `src/snapshot.rs`: turns uncommitted work into a snapshot commit.
 - `src/watch.rs`: the daemon: file watcher + polling loop, mDNS, and a thread
   fetching and applying peers.
+- `src/service.rs`: installs `watch` as a background service (systemd,
+  launchd, Task Scheduler), and the restart loop used on Windows.
+- `src/lock.rs`: per-repo locks, so only one `watch` runs per repo.
+- `src/log_file.rs`: the size-capped log file for `watch --log-file`.
 - `src/discovery.rs`: mDNS announcements and finding peers on the LAN.
 - `src/fetch.rs`: fetches a peer's branches and snapshots.
 - `src/apply.rs`: decides whether a peer's work is newer, applies or merges

@@ -21,7 +21,8 @@ the design could go several ways; they are easy to revisit.
  └────────────────────────┘            └────────────────────────┘
 ```
 
-Each machine runs a `gitsync daemon` that loops through four steps:
+Each machine runs `gitsync watch` (normally as a background service, section
+9), which loops through four steps:
 
 1. **Watch** the working tree for changes.
 2. **Snapshot** uncommitted work into a hidden git commit under its own ref.
@@ -294,7 +295,7 @@ url = "ssh://rafael@192.168.1.20/home/rafael/code/myproj"
 | `clap`                    | Command line parsing (`gitsync watch`, `snapshot` ...) |
 | `notify`, `notify-debouncer-full` | Cross-platform file watching with debouncing   |
 | `mdns-sd`                 | Peer discovery, pure Rust, no system daemon needed     |
-| `ctrlc`                   | Withdraw the mDNS announcement on Ctrl+C               |
+| `ctrlc`                   | Withdraw the mDNS announcement on Ctrl+C or SIGTERM    |
 | `serde`, `toml`           | Config file                                            |
 | `anyhow`                  | Simple error handling with context messages            |
 | `tracing`, `tracing-subscriber` | Logging                                          |
@@ -305,7 +306,44 @@ Not used, on purpose: an async runtime (tokio). The daemon does a few things at
 a human pace, so plain threads and channels are simpler to read, which matters
 while learning Rust. `git2`/`gix` may replace some `git` calls later for speed.
 
-## 9. Build plan
+## 9. Running in the background
+
+`gitsync service install` (in a repo) sets up `gitsync watch` for that repo
+as a background service that starts at login, and starts it now. One service
+per repo, named `gitsync-<folder>-<hash of the path>`, so several repos can
+each have one. `uninstall`, `start`, `stop` and `status` do what they say;
+`gitsync status` also says whether a watch runs. Each OS uses its own tool:
+
+| OS      | Service                                   | Log                                    | Restarts after a crash |
+|---------|-------------------------------------------|----------------------------------------|------------------------|
+| Linux   | systemd user unit in `~/.config/systemd/user/` | the journal: `journalctl --user-unit <name>` | systemd, after 10 s |
+| macOS   | launchd agent in `~/Library/LaunchAgents/` | `~/Library/Logs/gitsync/<name>.log`   | launchd, after 10 s    |
+| Windows | Task Scheduler task, started at logon     | `%LOCALAPPDATA%\gitsync\logs\<name>.log` | `gitsync service run`, after 10 s |
+
+- The service runs the gitsync program that installed it, in the repo's
+  folder, with the `PATH` of the shell it was installed from (Linux and
+  macOS), so it finds the same `git` and `ssh`. Settings still come from
+  `.git/gitsync.toml`; after changing them, or installing a new gitsync,
+  run `gitsync service install` again: it replaces and restarts the service.
+- **One watch per repo:** `watch` holds a lock (`.git/gitsync-watch.lock`)
+  and refuses to start a second time, since two would announce the same
+  machine on the LAN. The OS releases the lock when the process ends,
+  however it ends.
+- **Stopping:** systemd and launchd send SIGTERM, which `watch` handles like
+  Ctrl+C: it withdraws its mDNS announcement first.
+- **Linux:** user services run while the user is logged in. On a machine
+  nobody logs in to (a Raspberry Pi, a server), `sudo loginctl enable-linger
+  <user>` makes them start at boot; `install` prints this hint when needed.
+- **Windows:** the task runs through `conhost --headless`, so no console
+  window appears, and is allowed to start and keep running on battery.
+  Task Scheduler only restarts a task that fails to *start*, so the task
+  runs `gitsync service run`, a small loop that starts `watch`, and starts
+  it again 10 s after it stops, logging why. `service stop` ends that loop
+  and its watch. Windows cannot replace a running program, so stop the
+  service before installing a new gitsync, then run `install` again.
+- macOS support is written but not tested yet.
+
+## 10. Build plan
 
 1. ✅ Snapshot of uncommitted work to `refs/gitsync/<id>/wip` + `watch` loop.
 2. ✅ Config file and `gitsync status`.
@@ -313,4 +351,4 @@ while learning Rust. `git2`/`gix` may replace some `git` calls later for speed.
 4. ✅ Apply peer snapshots and fast-forward branches (with the safety rules).
 5. ✅ mDNS discovery and `gen` announcements.
 6. ✅ Merging when both changed, conflict handling and `gitsync resolve`.
-7. Run as a background service (systemd user unit, launchd agent, Windows task).
+7. ✅ Run as a background service (systemd user unit, launchd agent, Windows task).
