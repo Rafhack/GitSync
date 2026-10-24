@@ -284,7 +284,12 @@ fn service(git: &Git, action: ServiceAction) -> Result<()> {
                 );
             }
             service.install()?;
-            println!("installed and started {}", service.name);
+            let started = if service.can_start() {
+                "and started "
+            } else {
+                ""
+            };
+            println!("installed {started}{}", service.name);
             println!(
                 "  runs:  {} {}",
                 service.exe.display(),
@@ -292,10 +297,13 @@ fn service(git: &Git, action: ServiceAction) -> Result<()> {
             );
             println!("  from:  {}", service.location()?);
             println!("  log:   {}", service.log_hint());
-            if let Some(note) = service.linger_note() {
+            if let Some(note) = service.note() {
                 println!("  note:  {note}");
             }
-            println!("it starts again at every login; `gitsync service uninstall` removes it");
+            println!(
+                "it starts again at every {}; `gitsync service uninstall` removes it",
+                service.manager.starts_at()
+            );
         }
         ServiceAction::Uninstall => {
             if !service.state()?.installed {
@@ -314,8 +322,9 @@ fn service(git: &Git, action: ServiceAction) -> Result<()> {
         ServiceAction::Stop => {
             service.stop()?;
             println!(
-                "stopped {} (it starts again at the next login)",
-                service.name
+                "stopped {} (it starts again at the next {})",
+                service.name,
+                service.manager.starts_at()
             );
         }
         ServiceAction::Run { .. } => unreachable!("handled above"),
