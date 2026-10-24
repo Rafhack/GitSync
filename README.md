@@ -38,9 +38,9 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
   the side you pick; all other changes from both sides are kept).
 
 - `gitsync service install` runs `gitsync watch` for the repo in the
-  background, from login on, and restarts it if it crashes: a systemd user
-  service on Linux, a launchd agent on macOS (not tested yet), a hidden
-  Task Scheduler task on Windows. `gitsync service status` shows where its
+  background, from login on, and restarts it if it crashes: a user service
+  of systemd, OpenRC or runit on Linux, a launchd agent on macOS (not tested
+  yet), a hidden Task Scheduler task on Windows. `gitsync service status` shows where its
   log is; `uninstall`, `start` and `stop` do what they say. See DESIGN.md,
   section 9.
 
@@ -73,7 +73,8 @@ also needs `git` and an ssh server (DESIGN.md, section 5).
 - `src/watch.rs`: the daemon: file watcher + polling loop, mDNS, and a thread
   fetching and applying peers.
 - `src/service.rs`: installs `watch` as a background service (systemd,
-  launchd, Task Scheduler), and the restart loop used on Windows.
+  OpenRC, runit, launchd, Task Scheduler), and the restart loop used on
+  Windows.
 - `src/lock.rs`: per-repo locks, so only one `watch` runs per repo.
 - `src/log_file.rs`: the size-capped log file for `watch --log-file`.
 - `src/discovery.rs`: mDNS announcements and finding peers on the LAN.

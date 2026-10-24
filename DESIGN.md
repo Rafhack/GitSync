@@ -326,7 +326,9 @@ each have one. `uninstall`, `start`, `stop` and `status` do what they say;
 
 | OS      | Service                                   | Log                                    | Restarts after a crash |
 |---------|-------------------------------------------|----------------------------------------|------------------------|
-| Linux   | systemd user unit in `~/.config/systemd/user/` | the journal: `journalctl --user-unit <name>` | systemd, after 10 s |
+| Linux, systemd | user unit in `~/.config/systemd/user/` | the journal: `journalctl --user-unit <name>` | systemd, after 10 s |
+| Linux, OpenRC  | user service in `~/.config/rc/init.d/`, in the `default` runlevel | `~/.local/state/gitsync/logs/<name>.log` | supervise-daemon, after 10 s |
+| Linux, runit   | `~/.local/share/gitsync/runit/<name>/`, linked into `~/service/` | `~/.local/state/gitsync/logs/<name>.log` | runsv, after 10 s (its `finish` script waits) |
 | macOS   | launchd agent in `~/Library/LaunchAgents/` | `~/Library/Logs/gitsync/<name>.log`   | launchd, after 10 s    |
 | Windows | Task Scheduler task, started at logon     | `%LOCALAPPDATA%\gitsync\logs\<name>.log` | `gitsync service run`, after 10 s |
 
@@ -339,11 +341,27 @@ each have one. `uninstall`, `start`, `stop` and `status` do what they say;
   and refuses to start a second time, since two would announce the same
   machine on the LAN. The OS releases the lock when the process ends,
   however it ends.
-- **Stopping:** systemd and launchd send SIGTERM, which `watch` handles like
-  Ctrl+C: it withdraws its mDNS announcement first.
-- **Linux:** user services run while the user is logged in. On a machine
-  nobody logs in to (a Raspberry Pi, a server), `sudo loginctl enable-linger
-  <user>` makes them start at boot; `install` prints this hint when needed.
+- **Stopping:** systemd, OpenRC, runit and launchd send SIGTERM, which
+  `watch` handles like Ctrl+C: it withdraws its mDNS announcement first.
+- **Which Linux init system:** the one running: systemd if
+  `/run/systemd/system` exists, else OpenRC if `/run/openrc` does, else
+  runit if `/run/runit` does (or the first process is `openrc-init` or
+  `runit`). Anything else gets an error suggesting a startup script.
+- **Each needs root once, which `install` prints when it is missing:**
+  - systemd: user services run while the user is logged in. On a machine
+    nobody logs in to (a Raspberry Pi, a server), `sudo loginctl
+    enable-linger <user>` makes them start at boot.
+  - OpenRC (0.60 or newer, the first with user services): they run in the
+    user's OpenRC session, started at login by `openrc-user-pam`, or at
+    boot by `/etc/init.d/user.<user>` (package `openrc-user`; it needs
+    `XDG_RUNTIME_DIR` set by the user's login). gitsync looks for the
+    session in `$XDG_RUNTIME_DIR/openrc`, or `/run/user/<uid>/openrc`
+    when that is not set, as in some ssh sessions.
+  - runit has no user services of its own: as on Void Linux, root runs a
+    `runsvdir` for the user over `~/service` (or `$SVDIR`), which starts at
+    boot. `install` prints the four commands that set it up. runit restarts
+    a service a second after it stops; the `finish` script makes that 10 s
+    after a failure.
 - **Windows:** the task runs through `conhost --headless`, so no console
   window appears, and is allowed to start and keep running on battery.
   Task Scheduler only restarts a task that fails to *start*, so the task
@@ -361,4 +379,5 @@ each have one. `uninstall`, `start`, `stop` and `status` do what they say;
 4. ✅ Apply peer snapshots and fast-forward branches (with the safety rules).
 5. ✅ mDNS discovery and `gen` announcements.
 6. ✅ Merging when both changed, conflict handling and `gitsync resolve`.
-7. ✅ Run as a background service (systemd user unit, launchd agent, Windows task).
+7. ✅ Run as a background service (systemd user unit, launchd agent, Windows task;
+   later also OpenRC and runit user services).
