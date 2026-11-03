@@ -3,7 +3,8 @@
 gitsync keeps a git repository in sync across two or more machines on the same
 local network. It syncs both committed history and uncommitted work, with no
 central server. Every machine runs the same program and talks to the others
-using plain `git` over `ssh`.
+using plain `git`, over `ssh` or over gitsync's own encrypted connection
+(section 11).
 
 Status: draft, 2026-10-17. Sections marked **Default** are choices made where
 the design could go several ways; they are easy to revisit.
@@ -32,8 +33,8 @@ Each machine runs `gitsync watch` (normally as a background service, section
 
 **Default: pull-only.** A machine never writes into another machine's
 repository. It only fetches *from* peers and changes its own copy. This means
-a bug or a crash on one machine cannot corrupt another, and ssh only needs read
-access to the peer's repo.
+a bug or a crash on one machine cannot corrupt another, and a peer only needs
+read access to the repo.
 
 ## 2. Capturing uncommitted changes
 
@@ -181,6 +182,8 @@ git fetch ssh://user@desktop.local/path/to/repo \
   `git fetch`/`git pull` state is left alone.
 - `gitsync watch` fetches static peers every poll interval on a separate
   thread, so an unreachable peer never delays snapshots.
+- Without ssh: section 11 moves the same `git fetch` over gitsync's own TLS
+  connection, with machines paired once by a short code.
 - **Default: use the system `git` and `ssh` binaries** instead of a git library.
   This reuses the user's existing ssh keys, `~/.ssh/config` and agent with zero
   extra setup, and behaves exactly like the git the user already knows.
@@ -287,6 +290,10 @@ machine_id = "laptop"         # default: hostname
 poll_interval_secs = 30
 debounce_ms = 1000
 discovery = "mdns"            # or "static"
+transport = "ssh"             # or "gitsync" (section 11)
+
+[serve]                       # optional, transport = "gitsync" only
+port = 7431                   # default: any free port, announced over mDNS
 
 [advertise]                   # optional: how peers reach this machine
 user = "rafael"               # default: current user
@@ -296,6 +303,10 @@ port = 22
 [[peers]]                     # optional static peers
 name = "desktop"
 url = "ssh://rafael@192.168.1.20/home/rafael/code/myproj"
+
+[[peers]]                     # a static peer on the gitsync transport
+name = "server"
+url = "gitsync://192.168.1.30:7431"
 ```
 
 ## 8. Crates
@@ -310,6 +321,8 @@ url = "ssh://rafael@192.168.1.20/home/rafael/code/myproj"
 | `anyhow`                  | Simple error handling with context messages            |
 | `tracing`, `tracing-subscriber` | Logging                                          |
 | `gethostname`             | Default machine id                                     |
+| `rustls`, `rcgen`         | TLS and the machine's certificate (gitsync transport)  |
+| `spake2`, `hmac`, `sha2`  | Pairing by code, fingerprints                          |
 | `tempfile` (tests)        | Throwaway repos in tests                               |
 
 Not used, on purpose: an async runtime (tokio). The daemon does a few things at
@@ -381,3 +394,173 @@ each have one. `uninstall`, `start`, `stop` and `status` do what they say;
 6. ✅ Merging when both changed, conflict handling and `gitsync resolve`.
 7. ✅ Run as a background service (systemd user unit, launchd agent, Windows task;
    later also OpenRC and runit user services).
+8. Sync without ssh: the gitsync transport (section 11).
+   1. Machine identity, `gitsync id`, `gitsync pair`, `unpair`, `trust`.
+   2. Listener in `watch` and `ext::` fetch for `gitsync://` peers; tests
+      that sync two repos on localhost end to end (no ssh server needed, so
+      they can run in CI).
+   3. mDNS fields, `discover` and `status` for paired and unpaired peers.
+
+## 11. Syncing without ssh: the gitsync transport
+
+ssh works, but it is the hardest part of setting gitsync up: every machine
+needs an ssh server, an OS account for each peer, keys in `authorized_keys`, a
+first connection by hand to accept each host key, and on Windows Git Bash
+paths, firewall rules and console windows. The gitsync transport is a second
+way to move the same data, with the same security and much less setup.
+`transport = "ssh"` stays available and unchanged.
+
+**The idea.** `git fetch` over ssh is really two programs talking through a
+pipe: `git fetch` on our side and `git upload-pack` on the peer, with ssh
+providing an encrypted, authenticated pipe. gitsync can provide that pipe
+itself, with TLS, and git does not notice the difference. Everything after the
+fetch (section 6) stays the same.
+
+```
+ laptop (fetching)                              desktop (serving)
+ git fetch "ext::gitsync connect ..."           gitsync watch (listener)
+   │ git protocol on stdin/stdout                 ▲
+   ▼                                              │ TLS 1.3, both sides
+ gitsync connect ──────── TCP, TLS 1.3 ──────────►┤ show pinned keys
+                                                  ▼
+                                         git upload-pack <this repo>
+```
+
+### Machine identity
+
+On first use, gitsync creates a key pair for the machine (Ed25519) and a
+self-signed certificate for it, stored per user, not per repo:
+
+| OS      | Where                                          |
+|---------|------------------------------------------------|
+| Linux   | `~/.config/gitsync/identity.key` (mode 0600)   |
+| macOS   | `~/Library/Application Support/gitsync/`       |
+| Windows | `%APPDATA%\gitsync\` (only the user can read)  |
+
+The machine's **fingerprint** is a hash (SHA-256) of its public key, shown in
+short groups such as `7Q4K-M2XD-...`. `gitsync id` prints it. The private key
+never leaves the machine.
+
+### Pairing: trusting a peer, once
+
+Two machines trust each other after a one-time pairing, like pairing a
+Bluetooth device:
+
+1. On the desktop: `gitsync pair`. It prints a code such as `482-913` and
+   waits (at most 2 minutes).
+2. On the laptop: `gitsync pair 482-913`. It finds the desktop over mDNS (or
+   `--host <address>` where multicast is blocked).
+3. Both print the other machine's name and fingerprint, and remember it.
+
+Under the hood: the two machines open a TLS connection without checking
+certificates yet, then run **SPAKE2** (the `spake2` crate), a
+password-authenticated key exchange, with the code as the password. SPAKE2
+only succeeds if both sides typed the same code, and an eavesdropper learns
+nothing about the code. Each side then sends a confirmation (an HMAC under the
+SPAKE2 key) over both certificate fingerprints *as that side saw them*. A
+machine in the middle would have swapped the certificates, so the
+fingerprints would differ and pairing fails. The code is single-use and one
+wrong guess ends the attempt, so an attacker gets one guess in a million.
+
+The trust list (`trusted_peers.toml` next to the identity) maps each peer's
+fingerprint to its machine id. `gitsync unpair <machine>` removes one (for a
+lost laptop, unpair it on the others). `gitsync trust <machine>
+<fingerprint>` adds one by hand, for scripted setups.
+
+**Pairing is per pair of machines.** Three machines need three pairings
+(laptop-desktop, laptop-server, desktop-server). Letting a machine introduce
+its peers to a new one is possible later, but is left out on purpose: every
+trust decision stays explicit.
+
+### Serving
+
+Each `gitsync watch` with `transport = "gitsync"` opens a TCP listener for its
+repo. The port is picked by the OS and announced over mDNS; set
+`[serve] port` to fix it (for static peers or firewall rules). For every
+connection:
+
+1. TLS 1.3 with `rustls`. Both sides must show a certificate whose key is in
+   the trust list. There is no certificate authority and no host name, so a
+   peer whose IP changes needs no new trust (like `HostKeyAlias` today).
+2. The client sends one request line: `gitsync/1 upload-pack <repo id>`. The
+   repo id must be this repo's, so a stale port never serves the wrong repo.
+3. The server runs `git upload-pack --strict <repo>` and pipes the TLS stream
+   to it. With `-c uploadpack.hideRefs=refs/gitsync-peers` and
+   `-c uploadpack.hideRefs=refs/gitsync-state`, what we fetched from others
+   and our sync bookkeeping are not offered.
+
+Only `upload-pack` is ever started: never `receive-pack`, never a shell. So a
+paired peer can **read this repo, and nothing else**. With ssh, the same peer
+holds a key that opens a full shell on the machine.
+
+The listener uses plain threads, as the rest of gitsync (`rustls` works
+without an async runtime): one thread per connection, at most 8 at once, with
+a 10 s limit for the handshake. Connections from unknown keys are dropped
+before git is started.
+
+### Fetching
+
+Peers on the gitsync transport have URLs like `gitsync://desktop` (found over
+mDNS) or `gitsync://192.168.1.20:7431` (static). gitsync turns them into git's
+built-in `ext::` transport, which runs a command and talks the git protocol
+over its stdin and stdout:
+
+```
+git -c protocol.ext.allow=always fetch \
+    "ext::<path to gitsync> connect desktop %S" \
+    +refs/heads/*:refs/gitsync-peers/desktop/heads/* \
+    +refs/gitsync/desktop/*:refs/gitsync/desktop/*
+```
+
+`gitsync connect` opens the TLS connection, checks that the server's key is
+the one paired under the name `desktop`, sends the request line and copies
+bytes both ways. `ext::` is allowed only for this one command, so it stays
+off for the user's own `git` commands. (Spaces in the path to gitsync are
+written `% `, as `ext::` requires.)
+
+Everything else in section 5 holds: same refspecs, only the peer's own
+snapshots, no FETCH_HEAD, never prompts.
+
+### Discovery
+
+mDNS stays as in section 4. With the gitsync transport the announcement
+carries:
+
+- `transport` = `gitsync` (or `ssh`), and the service port = the listener's
+  port.
+- `key` = the machine's fingerprint, as a hint only. Trust always comes from
+  the TLS handshake against the trust list.
+- No `user` or `path`: they are not needed, so the repo's location on disk is
+  no longer broadcast on the LAN.
+
+A peer that announces a name must present the key paired under that name. A
+paired machine therefore cannot pose as another paired machine and slip its
+own work in under that machine's snapshot ref.
+
+`gitsync discover` marks peers that are not paired yet ("run `gitsync pair`"),
+and `gitsync status` shows which transport each peer uses.
+
+### ssh and gitsync transport side by side
+
+|                         | ssh                                    | gitsync transport                 |
+|-------------------------|----------------------------------------|-----------------------------------|
+| Encryption              | yes                                    | yes (TLS 1.3)                     |
+| Peer proves who it is   | host key, accepted by hand the first time | key pinned at pairing          |
+| We prove who we are     | key in the peer's `authorized_keys`    | key pinned at pairing             |
+| What a peer can do      | anything the account can (shell)       | read this one repo                |
+| Setup per machine       | ssh server, account, keys              | nothing                           |
+| Setup per pair          | copy keys, accept host keys both ways  | `gitsync pair` once               |
+| Network                 | TCP 22 in                              | one TCP port in (fixed or announced) |
+| Windows extras          | OpenSSH Server, Git Bash paths, no console windows | none                  |
+
+New risk: gitsync now accepts connections from the network. That is limited
+by `rustls` (memory-safe), by dropping unknown keys before anything else runs,
+and by the connection and time limits above.
+
+**Default: `transport = "ssh"` for now**, so nothing changes for existing
+setups. Once the gitsync transport has been used on all three OSes, the
+default can switch, with ssh kept as an option.
+
+**Windows:** the firewall needs one inbound TCP rule for `gitsync.exe` (like
+the UDP 5353 rule, section 4). `gitsync service install` prints the
+`netsh` command, since adding a rule needs an administrator.
