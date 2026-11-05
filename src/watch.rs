@@ -15,11 +15,13 @@ use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use tracing::{debug, info, warn};
 
 use crate::apply::{sync_peer, Plan};
-use crate::config::{Config, Discovery, Peer};
-use crate::discovery::{ipv6_note, Announcement, Mdns, PeerEvent};
+use crate::config::{Config, Discovery, Peer, Transport};
+use crate::discovery::{ipv6_note, repo_id, Announcement, Mdns, PeerEvent, Reach};
 use crate::fetch::fetch_peer;
 use crate::git::Git;
+use crate::identity::Identity;
 use crate::lock::ProcessLock;
+use crate::serve;
 use crate::snapshot::{snapshot, Outcome};
 
 /// How often a peer that announces its news is fetched anyway, in case an
@@ -69,7 +71,20 @@ pub fn watch(git: &Git, machine_id: &str, config: &Config) -> Result<()> {
     );
     take_snapshot(git, machine_id, &lock);
 
-    let presence = start_mdns(git, machine_id, config).map(Arc::new);
+    let serving = match config.transport {
+        Transport::Gitsync => match serve::start(git, config.serve.port.unwrap_or(0)) {
+            Ok(port) => {
+                info!("serving paired machines on TCP port {port} (gitsync transport)");
+                Some(port)
+            }
+            Err(err) => {
+                warn!("cannot serve over the gitsync transport ({err:#}); peers cannot fetch from this machine");
+                None
+            }
+        },
+        Transport::Ssh => None,
+    };
+    let presence = start_mdns(git, machine_id, config, serving).map(Arc::new);
     let peer_events = presence.as_ref().and_then(|p| p.browse());
     if let Some(presence) = &presence {
         // Say goodbye on Ctrl+C or SIGTERM, so peers forget us now instead
@@ -166,18 +181,26 @@ struct Presence {
     mdns: Mdns,
     git: Git,
     machine_id: String,
-    config: Config,
+    /// How peers reach us, and on which port; `None` if they cannot (the
+    /// gitsync listener failed): then we only look for peers.
+    reach: Option<(Reach, u16)>,
     repo: String,
 }
 
 /// Starts mDNS if the config asks for it. Problems are logged and gitsync
-/// carries on with the static peers only.
-fn start_mdns(git: &Git, machine_id: &str, config: &Config) -> Option<Presence> {
+/// carries on with the static peers only. `serving` is the gitsync
+/// transport's port, if it listens.
+fn start_mdns(
+    git: &Git,
+    machine_id: &str,
+    config: &Config,
+    serving: Option<u16>,
+) -> Option<Presence> {
     if config.discovery != Discovery::Mdns {
         return None;
     }
-    let announcement = match Announcement::for_repo(git, machine_id, config) {
-        Ok(Some(a)) => a,
+    let repo = match repo_id(git) {
+        Ok(Some(repo)) => repo,
         Ok(None) => {
             warn!("mDNS discovery starts after the first commit; using static peers only");
             return None;
@@ -187,6 +210,28 @@ fn start_mdns(git: &Git, machine_id: &str, config: &Config) -> Option<Presence> 
             return None;
         }
     };
+    let reach = match (config.transport, serving) {
+        (Transport::Gitsync, None) => None,
+        (Transport::Gitsync, Some(port)) => match Identity::load_or_create() {
+            Ok(identity) => Some((
+                Reach::Gitsync {
+                    key: identity.fingerprint,
+                },
+                port,
+            )),
+            Err(err) => {
+                warn!("cannot read this machine's key ({err:#}); not announcing");
+                None
+            }
+        },
+        (Transport::Ssh, _) => match Reach::ssh(git, config) {
+            Ok(reach) => Some(reach),
+            Err(err) => {
+                warn!("cannot announce over mDNS ({err:#}); peers will not find this machine");
+                None
+            }
+        },
+    };
     let mdns = match Mdns::start() {
         Ok(mdns) => mdns,
         Err(err) => {
@@ -194,34 +239,49 @@ fn start_mdns(git: &Git, machine_id: &str, config: &Config) -> Option<Presence> 
             return None;
         }
     };
-    if let Err(err) = mdns.announce(&announcement) {
-        warn!("cannot announce over mDNS ({err:#}); peers will not find this machine");
-    } else {
-        info!(
-            "announcing on the LAN as {} (ssh://{}@<this machine>{})",
-            announcement.machine, announcement.user, announcement.path
-        );
-    }
-    Some(Presence {
+    let presence = Presence {
         mdns,
         git: git.clone(),
         machine_id: machine_id.to_string(),
-        config: config.clone(),
-        repo: announcement.repo,
-    })
+        reach,
+        repo,
+    };
+    if let Some((reach, port)) = &presence.reach {
+        match presence.announce() {
+            Ok(_) => match reach {
+                Reach::Ssh { user, path } => info!(
+                    "announcing on the LAN as {machine_id} (ssh://{user}@<this machine>{path})"
+                ),
+                Reach::Gitsync { .. } => {
+                    info!("announcing on the LAN as {machine_id} (gitsync transport, port {port})")
+                }
+            },
+            Err(err) => {
+                warn!("cannot announce over mDNS ({err:#}); peers will not find this machine")
+            }
+        }
+    }
+    Some(presence)
 }
 
 impl Presence {
+    /// Announces our current state; true if it changed.
+    fn announce(&self) -> Result<bool> {
+        let Some((reach, port)) = &self.reach else {
+            return Ok(false);
+        };
+        match Announcement::for_repo(&self.git, &self.machine_id, reach, *port)? {
+            Some(announcement) => self.mdns.announce(&announcement),
+            None => Ok(false),
+        }
+    }
+
     /// Re-announces if our branches or snapshot changed (a new `gen`).
     fn refresh(&self) {
-        match Announcement::for_repo(&self.git, &self.machine_id, &self.config) {
-            Ok(Some(announcement)) => match self.mdns.announce(&announcement) {
-                Ok(true) => debug!("announced gen {}", announcement.gen),
-                Ok(false) => {}
-                Err(err) => warn!("cannot announce over mDNS: {err:#}"),
-            },
-            Ok(None) => {}
-            Err(err) => debug!("cannot build announcement: {err:#}"),
+        match self.announce() {
+            Ok(true) => debug!("announced a new gen"),
+            Ok(false) => {}
+            Err(err) => warn!("cannot announce over mDNS: {err:#}"),
         }
     }
 

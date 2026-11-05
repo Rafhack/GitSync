@@ -7,14 +7,17 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 
 use gitsync::apply::{self as sync, sync_peer, Plan, Side};
-use gitsync::config::{Config, Discovery, Peer};
-use gitsync::discovery::{ipv6_note, Announcement, Found, Mdns, PeerEvent};
+use gitsync::config::{Config, Discovery, Peer, Transport};
+use gitsync::discovery::{ipv6_note, repo_id, Found, Mdns, PeerEvent};
 use gitsync::fetch::{fetch_peer, fetched_peer_names, ssh_target};
 use gitsync::git::Git;
+use gitsync::identity::Identity;
 use gitsync::log_file::LogFile;
+use gitsync::pair;
 use gitsync::service::Service;
 use gitsync::snapshot::{self, Outcome};
 use gitsync::status::Status;
+use gitsync::trust::TrustList;
 use gitsync::watch;
 
 /// Keep a git repository, including uncommitted work, in sync across machines.
@@ -91,6 +94,38 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         secs: u64,
     },
+    /// Show this machine's name and key fingerprint (gitsync transport).
+    Id,
+    /// Pair with another machine, once, so they sync over the gitsync
+    /// transport. Run it without a code on one machine; it prints a code to
+    /// run on the other: `gitsync pair <code>`.
+    Pair {
+        /// The code the other machine printed.
+        code: Option<String>,
+        /// The waiting machine's address (`host:port`, which it prints), for
+        /// networks that block multicast.
+        #[arg(long, requires = "code")]
+        host: Option<String>,
+        /// Wait on this TCP port (default: any free port).
+        #[arg(long, conflicts_with = "code")]
+        port: Option<u16>,
+    },
+    /// Stop trusting a paired machine (for a lost laptop: on every other).
+    Unpair { machine: String },
+    /// Trust a machine's key by hand (`gitsync id` there prints it), for
+    /// scripted setups. Pairing does the same, checked by a code.
+    Trust {
+        machine: String,
+        fingerprint: String,
+    },
+    /// What `git fetch` runs to reach a peer over the gitsync transport.
+    #[command(hide = true)]
+    Connect {
+        machine: String,
+        addr: String,
+        repo: String,
+        service: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -137,6 +172,11 @@ fn main() -> Result<()> {
             .with_ansi(false)
             .with_writer(Mutex::new(LogFile::open(path)?))
             .init(),
+        // stdout carries the git protocol.
+        Command::Connect { .. } => tracing_subscriber::fmt()
+            .with_env_filter(filter())
+            .with_writer(std::io::stderr)
+            .init(),
         Command::Service {
             action: ServiceAction::Run { log_file },
         } => tracing_subscriber::fmt()
@@ -150,10 +190,47 @@ fn main() -> Result<()> {
             .init(),
     }
 
+    // Commands about this machine rather than a repo.
+    match &cli.command {
+        Command::Connect {
+            machine,
+            addr,
+            repo,
+            service,
+        } => {
+            // git shows this to the user as the reason the fetch failed.
+            if let Err(err) = gitsync::connect::connect(machine, addr, repo, service) {
+                eprintln!("{err:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Command::Trust {
+            machine,
+            fingerprint,
+        } => return trust(machine, fingerprint),
+        Command::Unpair { machine } => {
+            let mut list = TrustList::load()?;
+            if !list.remove(machine) {
+                bail!("{machine:?} is not paired with this machine");
+            }
+            list.save()?;
+            println!("unpaired {machine}; it can no longer fetch from this machine, nor this one from it");
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let git = Git::new(cli.dir);
 
     // Effective settings: config file, then command line flags on top.
-    let mut config = Config::load(&git)?;
+    // `id` and `pair` also work outside a repo, with the defaults.
+    let in_repo = git.git_dir().is_ok();
+    let mut config = if in_repo || !matches!(cli.command, Command::Id | Command::Pair { .. }) {
+        Config::load(&git)?
+    } else {
+        Config::default()
+    };
     if let Some(id) = cli.machine_id {
         config.machine_id = Some(id);
     }
@@ -179,11 +256,36 @@ fn main() -> Result<()> {
         Command::Watch { .. } => watch::watch(&git, &machine_id, &config)?,
         Command::Fetch { peer } => fetch(&git, &machine_id, &config, peer.as_deref())?,
         Command::Apply { peer } => apply(&git, &machine_id, &config, peer.as_deref())?,
-        Command::Service { action } => service(&git, action)?,
+        Command::Service { action } => service(&git, &config, action)?,
         Command::Resolve { take, keep_mine } => {
             resolve(&git, &machine_id, &config, take, keep_mine)?
         }
-        Command::Discover { secs } => discover(&git, &machine_id, &config, secs)?,
+        Command::Discover { secs } => discover(&git, &machine_id, secs)?,
+        Command::Id => {
+            let identity = Identity::load_or_create()?;
+            println!("machine  {machine_id}");
+            println!("key      {}", identity.fingerprint);
+        }
+        Command::Pair { code, host, port } => {
+            let paired = match code {
+                None => pair::wait(&machine_id, port.unwrap_or(0), true)?,
+                Some(code) => pair::join(&machine_id, &code, host.as_deref())?,
+            };
+            println!("paired with {}", paired.machine);
+            println!("  key  {}", paired.key);
+            for old in &paired.replaced {
+                println!("  (replaces {old})");
+            }
+            if config.transport == Transport::Ssh {
+                println!(
+                    "note: this repo still serves over ssh; set transport = \"gitsync\" in \
+                     .git/gitsync.toml (or remove the line) to serve paired machines"
+                );
+            }
+        }
+        Command::Connect { .. } | Command::Trust { .. } | Command::Unpair { .. } => {
+            unreachable!("handled above")
+        }
         Command::Status => print!("{}", Status::collect(&git, &machine_id, config)?),
     }
     Ok(())
@@ -194,7 +296,7 @@ fn main() -> Result<()> {
 fn fetch(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Result<()> {
     let mut peers = config.peers.clone();
     if config.discovery == Discovery::Mdns {
-        for found in listen(git, machine_id, config, Duration::from_secs(2))? {
+        for found in listen(git, machine_id, Duration::from_secs(2))? {
             // A configured peer's address wins over an announced one.
             if !peers.iter().any(|p| p.name == found.peer.name) {
                 peers.push(found.peer);
@@ -269,7 +371,7 @@ fn apply(git: &Git, machine_id: &str, config: &Config, only: Option<&str>) -> Re
 }
 
 /// `gitsync service ...`
-fn service(git: &Git, action: ServiceAction) -> Result<()> {
+fn service(git: &Git, config: &Config, action: ServiceAction) -> Result<()> {
     if let ServiceAction::Run { log_file } = &action {
         return gitsync::service::supervise(git, log_file);
     }
@@ -299,6 +401,15 @@ fn service(git: &Git, action: ServiceAction) -> Result<()> {
             println!("  log:   {}", service.log_hint());
             if let Some(note) = service.note() {
                 println!("  note:  {note}");
+            }
+            if cfg!(windows) && config.transport == Transport::Gitsync {
+                println!(
+                    "  note:  peers can only connect once the Windows firewall allows it; once, \
+                     in an administrator PowerShell:\n\
+                     \x20          netsh advfirewall firewall add rule name=\"gitsync\" dir=in \
+                     action=allow program=\"{}\" protocol=TCP",
+                    service.exe.display()
+                );
             }
             println!(
                 "it starts again at every {}; `gitsync service uninstall` removes it",
@@ -423,6 +534,22 @@ fn resolve(
     Ok(())
 }
 
+/// `gitsync trust <machine> <fingerprint>`
+fn trust(machine: &str, fingerprint: &str) -> Result<()> {
+    gitsync::snapshot::validate_machine_id(machine)?;
+    let mut list = TrustList::load()?;
+    let replaced = list.add(machine, fingerprint)?;
+    list.save()?;
+    println!(
+        "trusting {machine} ({})",
+        list.key_for(machine).unwrap_or_default()
+    );
+    for old in replaced {
+        println!("  (replaces {} {})", old.machine, old.key);
+    }
+    Ok(())
+}
+
 /// All `peers`, or just the one named `only`.
 fn select(peers: Vec<Peer>, only: Option<&str>) -> Result<Vec<Peer>> {
     let peers: Vec<_> = peers
@@ -442,12 +569,12 @@ fn select(peers: Vec<Peer>, only: Option<&str>) -> Result<Vec<Peer>> {
 }
 
 /// Peers for this repo announcing themselves on the LAN, heard within `wait`.
-fn listen(git: &Git, machine_id: &str, config: &Config, wait: Duration) -> Result<Vec<Found>> {
-    let Some(ours) = Announcement::for_repo(git, machine_id, config)? else {
+fn listen(git: &Git, machine_id: &str, wait: Duration) -> Result<Vec<Found>> {
+    let Some(repo) = repo_id(git)? else {
         bail!("this repo has no commits yet, so it has no id peers could match");
     };
     let mdns = Mdns::start()?;
-    let events = mdns.browse(&ours.repo, machine_id)?;
+    let events = mdns.browse(&repo, machine_id)?;
     let deadline = Instant::now() + wait;
     let mut found: Vec<Found> = Vec::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
@@ -464,9 +591,11 @@ fn listen(git: &Git, machine_id: &str, config: &Config, wait: Duration) -> Resul
     Ok(found)
 }
 
-/// `gitsync discover`: who is out there, and is ssh ready to reach them?
-fn discover(git: &Git, machine_id: &str, config: &Config, secs: u64) -> Result<()> {
-    let found = listen(git, machine_id, config, Duration::from_secs(secs))?;
+/// `gitsync discover`: who is out there, and can we reach them (paired, or
+/// ssh knows them)?
+fn discover(git: &Git, machine_id: &str, secs: u64) -> Result<()> {
+    let found = listen(git, machine_id, Duration::from_secs(secs))?;
+    let trusted = TrustList::load()?;
     if found.is_empty() {
         println!("no peers for this repo found on the LAN within {secs}s");
         println!("(is `gitsync watch` running on them, with discovery = \"mdns\"?)");
@@ -480,6 +609,20 @@ fn discover(git: &Git, machine_id: &str, config: &Config, secs: u64) -> Result<(
             f.gen,
             ipv6_note(&f.peer.url)
         );
+        if let Some(hint) = &f.key_hint {
+            let peer = &f.peer.name;
+            match trusted.key_for(peer) {
+                Some(key) if key == hint => println!("  paired"),
+                Some(_) => println!(
+                    "  announces a different key than the one paired as {peer}; fetching \
+                     will fail until the two machines are paired again"
+                ),
+                None => println!(
+                    "  not paired yet: run `gitsync pair` on {peer}, then `gitsync pair <code>` here"
+                ),
+            }
+            continue;
+        }
         let alias = f.peer.host_key_alias.as_deref().unwrap_or_default();
         if !host_key_known(alias) {
             let target = f

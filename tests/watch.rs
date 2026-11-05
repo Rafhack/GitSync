@@ -13,6 +13,8 @@ use gitsync::watch::{is_running, running_pid};
 fn gitsync(dir: &std::path::Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gitsync"));
     cmd.arg("-C").arg(dir).args(args);
+    // This machine's key and trust list: not the user's real ones.
+    cmd.env("GITSYNC_CONFIG_DIR", dir.join(".git/test-config"));
     cmd
 }
 

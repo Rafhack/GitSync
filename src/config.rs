@@ -28,8 +28,29 @@ pub struct Config {
     pub discovery: Discovery,
     /// Peers listed by hand (always used, whatever `discovery` says).
     pub peers: Vec<Peer>,
-    /// How peers should reach this machine, announced over mDNS.
+    /// How peers fetch from this machine (DESIGN.md §11).
+    pub transport: Transport,
+    /// The gitsync transport's listener.
+    pub serve: Serve,
+    /// How peers should reach this machine over ssh, announced over mDNS.
     pub advertise: Advertise,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    /// gitsync's own TLS connection between paired machines.
+    #[default]
+    Gitsync,
+    /// `git fetch` over ssh.
+    Ssh,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Serve {
+    /// TCP port to listen on (default: any free port, announced over mDNS).
+    pub port: Option<u16>,
 }
 
 /// Overrides for what this machine announces (DESIGN.md §4). Each field
@@ -54,6 +75,8 @@ impl Default for Config {
             debounce_ms: 1000,
             discovery: Discovery::default(),
             peers: Vec::new(),
+            transport: Transport::default(),
+            serve: Serve::default(),
             advertise: Advertise::default(),
         }
     }
@@ -151,6 +174,9 @@ impl Config {
             if peer.url.trim().is_empty() {
                 bail!("peer {:?} has an empty url", peer.name);
             }
+            if peer.url.starts_with("gitsync:") {
+                gitsync_address(&peer.url).with_context(|| format!("peer {:?}", peer.name))?;
+            }
             if Some(&peer.name) == self.machine_id.as_ref() {
                 bail!("peer {:?} has the same name as this machine", peer.name);
             }
@@ -162,6 +188,28 @@ impl Config {
     }
 }
 
+/// `host:port` from a `gitsync://host:port` URL. The host is a name, an
+/// IPv4 address or a bracketed IPv6 address; the port is required.
+pub fn gitsync_address(url: &str) -> Result<&str> {
+    let Some(addr) = url.strip_prefix("gitsync://") else {
+        bail!("{url:?} is not a gitsync:// URL");
+    };
+    let (host, port) = match addr.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => (host, port),
+        _ => bail!("{url:?} needs a port, like gitsync://192.168.1.30:7431"),
+    };
+    let host_ok = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')),
+    };
+    if !host_ok || !matches!(port.parse::<u16>(), Ok(p) if p > 0) {
+        bail!("{url:?} is not a usable gitsync:// URL (gitsync://host:port)");
+    }
+    Ok(addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +217,34 @@ mod tests {
     #[test]
     fn empty_file_gives_defaults() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
+        assert_eq!(Config::default().transport, Transport::Gitsync);
+    }
+
+    #[test]
+    fn gitsync_urls() {
+        assert_eq!(
+            gitsync_address("gitsync://10.0.0.9:7431").unwrap(),
+            "10.0.0.9:7431"
+        );
+        assert_eq!(
+            gitsync_address("gitsync://[2001:db8::5]:7431").unwrap(),
+            "[2001:db8::5]:7431"
+        );
+        assert_eq!(
+            gitsync_address("gitsync://pi.local:1").unwrap(),
+            "pi.local:1"
+        );
+        for bad in [
+            "gitsync://10.0.0.9",
+            "gitsync://:7431",
+            "gitsync://10.0.0.9:0",
+            "gitsync://a b:7431",
+            "gitsync://x%y:7431",
+            "gitsync://[nope]:7431",
+            "ssh://x",
+        ] {
+            assert!(gitsync_address(bad).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]
@@ -179,12 +255,21 @@ mod tests {
             poll_interval_secs = 10
             debounce_ms = 500
             discovery = "static"
+            transport = "ssh"
+            [serve]
+            port = 7431
             [[peers]]
             name = "desktop"
             url = "ssh://rafael@192.168.1.20/home/rafael/code/myproj"
+            [[peers]]
+            name = "server"
+            url = "gitsync://192.168.1.30:7431"
             "#,
         )
         .unwrap();
+        assert_eq!(config.transport, Transport::Ssh);
+        assert_eq!(config.serve.port, Some(7431));
+        assert_eq!(config.peers[1].url, "gitsync://192.168.1.30:7431");
         assert_eq!(config.machine_id.as_deref(), Some("laptop"));
         assert_eq!(config.poll_interval_secs, 10);
         assert_eq!(config.debounce_ms, 500);
@@ -215,7 +300,10 @@ mod tests {
             "poll_intervall_secs = 5",   // typo in a key
             "poll_interval_secs = 0",    // would spin
             "discovery = \"bluetooth\"", // unknown discovery
-            "machine_id = \"a/b\"",      // not one ref component
+            "transport = \"carrier-pigeon\"",
+            "[serve]\nport = 70000",
+            "[[peers]]\nname = \"x\"\nurl = \"gitsync://10.0.0.9\"",
+            "machine_id = \"a/b\"", // not one ref component
             "[[peers]]\nname = \"x y\"\nurl = \"u\"",
             "[[peers]]\nname = \"x\"\nurl = \"\"",
             "[[peers]]\nname = \"x\"\nurl = \"u\"\n[[peers]]\nname = \"x\"\nurl = \"v\"",

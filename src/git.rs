@@ -97,7 +97,12 @@ fn failure(args: &[&str], output: &Output) -> String {
                 && *line != "and the repository exists."
         })
         .collect();
-    let subcommand = args.first().copied().unwrap_or("");
+    // Skip `-c name=value` options to name the subcommand.
+    let mut rest = args;
+    while let ["-c", _, tail @ ..] = rest {
+        rest = tail;
+    }
+    let subcommand = rest.first().copied().unwrap_or("");
     if message.is_empty() {
         format!("`git {subcommand}` failed ({})", output.status)
     } else {

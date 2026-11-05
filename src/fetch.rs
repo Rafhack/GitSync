@@ -1,5 +1,6 @@
-//! Fetches a peer's branches and snapshots over plain `git fetch` (usually
-//! ssh). See DESIGN.md §5.
+//! Fetches a peer's branches and snapshots over plain `git fetch`: over the
+//! gitsync transport for `gitsync://` peers (DESIGN.md §11), else over ssh
+//! (or whatever the URL says). See DESIGN.md §5.
 //!
 //! Pull-only: we never write to the peer. Its branches land in a private
 //! namespace and never touch our own branches:
@@ -13,7 +14,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 
-use crate::config::Peer;
+use crate::config::{gitsync_address, Peer};
+use crate::discovery::repo_id;
 use crate::git::Git;
 
 /// Where a peer's branches are stored locally.
@@ -61,30 +63,38 @@ pub fn fetch_peer(git: &Git, peer: &Peer) -> Result<FetchReport> {
 
     let heads_spec = format!("+refs/heads/*:{heads}*");
     let snapshots_spec = format!("+{snapshots}*:{snapshots}*");
-    let ssh = ssh_command(git, peer.host_key_alias.as_deref())?;
+    let mut args = Vec::new();
     let mut envs = vec![("GIT_TERMINAL_PROMPT", "0")];
-    if let Some(ssh) = &ssh {
-        envs.push(("GIT_SSH_COMMAND", ssh.as_str()));
-    }
-    git.run_env(
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--prune",
-            // FETCH_HEAD belongs to the user's own `git fetch`/`git pull`.
-            "--no-write-fetch-head",
-            &peer.url,
-            &heads_spec,
-            &snapshots_spec,
-        ],
-        &envs,
-    )
-    .map_err(|err| match ssh_hint(&format!("{err:#}"), peer) {
-        Some(hint) => err.context(hint),
-        None => err,
-    })
-    .with_context(|| format!("fetching from peer {:?} ({})", peer.name, peer.url))?;
+    let ssh;
+    let url = if peer.url.starts_with("gitsync:") {
+        // Allowed for this one command only; the user's own git keeps
+        // ext:: off.
+        args.extend(["-c", "protocol.ext.allow=always"]);
+        ext_url(git, peer)?
+    } else {
+        ssh = ssh_command(git, peer.host_key_alias.as_deref())?;
+        if let Some(ssh) = &ssh {
+            envs.push(("GIT_SSH_COMMAND", ssh.as_str()));
+        }
+        peer.url.clone()
+    };
+    args.extend([
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--prune",
+        // FETCH_HEAD belongs to the user's own `git fetch`/`git pull`.
+        "--no-write-fetch-head",
+        &url,
+        &heads_spec,
+        &snapshots_spec,
+    ]);
+    git.run_env(&args, &envs)
+        .map_err(|err| match ssh_hint(&format!("{err:#}"), peer) {
+            Some(hint) => err.context(hint),
+            None => err,
+        })
+        .with_context(|| format!("fetching from peer {:?} ({})", peer.name, peer.url))?;
 
     let after = list_refs(git, &[&heads, &snapshots])?;
     let has_snapshot = after.keys().any(|name| name.starts_with(&snapshots));
@@ -93,6 +103,33 @@ pub fn fetch_peer(git: &Git, peer: &Peer) -> Result<FetchReport> {
         changes: diff_refs(&before, &after),
         has_snapshot,
     })
+}
+
+/// The `ext::` URL that makes git fetch through `gitsync connect`:
+/// `ext::<gitsync> connect <peer> <host:port> <repo id> %S`.
+fn ext_url(git: &Git, peer: &Peer) -> Result<String> {
+    let addr = gitsync_address(&peer.url)?;
+    let repo = repo_id(git)?
+        .context("this repo has no commits yet, so peers cannot tell it is the same project")?;
+    let exe = match std::env::var_os("GITSYNC_EXE") {
+        Some(exe) => std::path::PathBuf::from(exe),
+        None => std::env::current_exe().context("finding the gitsync program")?,
+    };
+    let exe = exe.to_string_lossy();
+    let exe = exe.strip_prefix(r"\\?\").unwrap_or(&exe);
+    Ok(format!(
+        "ext::{} connect {} {} {} %S",
+        ext_escape(exe),
+        ext_escape(&peer.name),
+        ext_escape(addr),
+        ext_escape(&repo)
+    ))
+}
+
+/// `ext::` splits its command on spaces and expands `%` sequences: a
+/// literal space is written `% ` and a `%` is written `%%`.
+fn ext_escape(arg: &str) -> String {
+    arg.replace('%', "%%").replace(' ', "% ")
 }
 
 /// ssh must never stop to ask for a password or a host key: gitsync runs
@@ -196,8 +233,17 @@ fn diff_refs(
 
 #[cfg(test)]
 mod tests {
-    use super::{ssh_hint, ssh_target};
+    use super::{ext_escape, ssh_hint, ssh_target};
     use crate::config::Peer;
+
+    #[test]
+    fn ext_escaping() {
+        assert_eq!(
+            ext_escape("C:/Program Files/gitsync 100%.exe"),
+            "C:/Program% Files/gitsync% 100%%.exe"
+        );
+        assert_eq!(ext_escape("[2001:db8::5]:7431"), "[2001:db8::5]:7431");
+    }
 
     #[test]
     fn ssh_targets() {
