@@ -55,15 +55,59 @@ connection between paired machines (or over ssh). See [DESIGN.md](DESIGN.md).
 
 All steps of the build plan (DESIGN.md, section 10) are done.
 
-## Set up two machines
+## Tutorial: sync a repo between two machines
 
-1. Install gitsync on both (below), and clone the repo on both.
-2. On one machine, in the repo: `gitsync pair`. It prints a code.
-3. On the other, in the repo: `gitsync pair <code>` (within 2 minutes).
-4. On both: `gitsync service install`.
+Say a `desktop` and a `laptop` on the same network, both with the repo
+cloned and gitsync installed (see Download below).
 
-For three machines, pair each two once. To sync over ssh instead, set
-`transport = "ssh"` in `.git/gitsync.toml` (DESIGN.md, sections 4 and 5).
+1. **Name the machines** (optional). Each machine is known by its hostname.
+   To pick a name, put `machine_id = "desktop"` in the repo's
+   `.git/gitsync.toml`. Use the same name in every repo on that machine.
+
+2. **Pair them, once.** On the desktop, in the repo:
+
+   ```
+   $ gitsync pair
+   pairing code: 482-913
+   on the other machine, in the repo, run:
+     gitsync pair 482-913
+   ```
+
+   Within 2 minutes, on the laptop, in the repo:
+
+   ```
+   $ gitsync pair 482-913
+   paired with desktop
+   ```
+
+   They find each other on the LAN by themselves. Where multicast is
+   blocked, add the `--host` the desktop printed. A mistyped code just
+   ends the attempt: run `gitsync pair` again.
+
+3. **Start syncing.** On both machines, in the repo:
+
+   ```
+   gitsync service install
+   ```
+
+   It runs in the background from now on, also after a restart. On
+   Windows, it also prints a firewall command to run once as
+   administrator, so the other machine can connect.
+
+4. **Try it.** Edit a file on the desktop and save it: within a few
+   seconds the change is on the laptop, without committing anything.
+   `gitsync status` shows each peer and whether it is in sync;
+   `gitsync discover` lists the machines it hears and whether they are
+   paired.
+
+5. **If both change the same lines** before they sync, nothing is
+   overwritten: `gitsync resolve` lists the files, and
+   `gitsync resolve --take desktop` or `gitsync resolve --keep-mine`
+   settles it.
+
+For a third machine, pair it with each of the others once. To sync over
+ssh instead, set `transport = "ssh"` in `.git/gitsync.toml` (DESIGN.md,
+sections 4 and 5).
 
 ## Download
 
