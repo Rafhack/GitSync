@@ -129,6 +129,19 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      # Takes this version's section of CHANGELOG.md (empty if there is none).
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          touch CHANGELOG.md
+          awk -v h="## $TAG" '$0 == h {on=1; next} /^## / {on=0} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -142,6 +155,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
           SHA: ${{ needs.prepare.outputs.sha }}
+        # The CHANGELOG section goes first, then GitHub's list of merged PRs.
         # --target creates the tag on that commit if it does not exist yet
         # (the merged-PR case); for a pushed tag it is already there.
         run: |
@@ -149,4 +163,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$SHA" \
             --title "gitsync $TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
             --generate-notes
