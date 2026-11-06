@@ -7,11 +7,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::apply::{plan, Plan};
-use crate::config::{Config, Discovery};
+use crate::config::{Config, Discovery, Transport};
 use crate::fetch::{fetched_peer_names, peer_heads_prefix};
 use crate::git::Git;
+use crate::identity::Identity;
 use crate::service::Service;
 use crate::snapshot::{has_unsaved_changes, wip_ref};
+use crate::trust::TrustList;
 use crate::watch;
 
 #[derive(Debug, Clone)]
@@ -34,6 +36,8 @@ pub struct Status {
     pub peers: Vec<PeerStatus>,
     /// Whether `gitsync watch` runs, as a service or by hand, in words.
     pub watcher: String,
+    /// This machine's key fingerprint (gitsync transport), once it has one.
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +50,8 @@ pub struct PeerStatus {
     pub branches: Vec<PeerBranch>,
     /// What would happen with the peer's snapshot.
     pub plan: Plan,
+    /// Paired with this machine (in the gitsync transport's trust list).
+    pub paired: bool,
 }
 
 /// A branch fetched from a peer, compared with our branch of the same name.
@@ -114,10 +120,12 @@ impl Status {
                 names.push((name, None));
             }
         }
+        let trusted = TrustList::load()?;
         let peers = names
             .into_iter()
             .map(|(name, url)| {
                 Ok(PeerStatus {
+                    paired: trusted.key_for(&name).is_some(),
                     branches: peer_branches(git, &name)?,
                     plan: plan(git, machine_id, &name)?,
                     name,
@@ -129,6 +137,7 @@ impl Status {
         Ok(Self {
             peers,
             watcher: watcher(git),
+            key: Identity::existing_fingerprint()?,
             machine_id: machine_id.to_string(),
             config_found: config_path.exists(),
             config_path,
@@ -275,6 +284,21 @@ impl fmt::Display for Status {
             Discovery::Static => "static (only the peers listed in the config)",
         };
         writeln!(f, "discovery {discovery}")?;
+        match self.config.transport {
+            Transport::Gitsync => {
+                writeln!(
+                    f,
+                    "transport gitsync (paired machines fetch from this one over TLS)"
+                )?;
+                match &self.key {
+                    Some(key) => writeln!(f, "key       {key}")?,
+                    None => writeln!(f, "key       none yet (made when `gitsync watch` starts)")?,
+                }
+            }
+            Transport::Ssh => {
+                writeln!(f, "transport ssh (peers fetch from this machine over ssh)")?
+            }
+        }
         writeln!(f, "watch     {}", self.watcher)?;
         if self.peers.is_empty() {
             writeln!(f, "peers     none yet")?;
@@ -285,7 +309,17 @@ impl fmt::Display for Status {
                     .url
                     .as_deref()
                     .unwrap_or("(not in the config; found on the LAN earlier)");
-                writeln!(f, "  {}  {url}", peer.name)?;
+                let gitsync = peer
+                    .url
+                    .as_deref()
+                    .is_some_and(|u| u.starts_with("gitsync:"));
+                // A peer found on the LAN (no URL) may use either transport.
+                let pairing = match (gitsync, peer.paired) {
+                    (_, true) if peer.url.is_none() || gitsync => "  (paired)",
+                    (true, false) => "  (not paired: `gitsync pair`)",
+                    _ => "",
+                };
+                writeln!(f, "  {}  {url}{pairing}", peer.name)?;
                 writeln!(f, "    sync: {}", peer.plan)?;
                 if peer.branches.is_empty() {
                     writeln!(f, "    (not fetched yet; run `gitsync fetch`)")?;

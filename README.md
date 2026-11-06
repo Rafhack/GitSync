@@ -1,7 +1,8 @@
 # gitsync
 
 Keeps a git repository (history and uncommitted work) in sync across machines on
-the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN.md).
+the same local network, peer to peer, using plain git over its own encrypted
+connection between paired machines (or over ssh). See [DESIGN.md](DESIGN.md).
 
 ## What works today
 
@@ -14,16 +15,24 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
   changes not in a snapshot yet, the settings, and other machines' snapshots.
 - Optional settings file `.git/gitsync.toml` (see DESIGN.md, section 7).
   Command line flags override it.
-- `gitsync fetch` pulls branches and snapshots from the `[[peers]]` in the
-  settings file over ssh, into private refs (your own branches are never
+- Machines trust each other after pairing once: `gitsync pair` on one prints
+  a code, `gitsync pair <code>` on the other. Then they sync over gitsync's
+  own TLS connection (the default `transport = "gitsync"`): no ssh server,
+  accounts or keys to set up, and a paired machine can only read the repo.
+  `gitsync id` shows this machine's key; `gitsync unpair <machine>` forgets
+  one. On Windows, allow incoming TCP for gitsync once
+  (`gitsync service install` prints the command). See DESIGN.md, section 11.
+- `gitsync fetch` pulls branches and snapshots from peers (paired ones, or
+  over ssh with `transport = "ssh"`), into private refs (your own branches are never
   touched). `gitsync watch` also does this every poll interval, and
   `gitsync status` shows how each peer branch compares with yours.
   A peer's `name` must match the `machine_id` it uses.
 - Peers find each other on the LAN by themselves (mDNS, the default
   `discovery = "mdns"`): `gitsync watch` announces this machine and fetches a
   peer as soon as it announces news, so no IP addresses go in the config.
-  `gitsync discover` lists the peers it hears. The first time, ssh has to
-  learn each peer's key: `gitsync discover` prints the one-time command.
+  `gitsync discover` lists the peers it hears and whether they are paired
+  (over ssh, the first time ssh has to learn each peer's key:
+  `gitsync discover` prints the one-time command).
   On Windows, allow incoming UDP 5353 for gitsync (DESIGN.md, section 4).
 - Fetched work is applied when it is safe: if you have not changed anything
   since the last sync, the peer's files (and its commits on your branch) are
@@ -46,18 +55,74 @@ the same local network, peer to peer, using git over ssh. See [DESIGN.md](DESIGN
 
 All steps of the build plan (DESIGN.md, section 10) are done.
 
+## Tutorial: sync a repo between two machines
+
+Say a `desktop` and a `laptop` on the same network, both with the repo
+cloned and gitsync installed (see Download below).
+
+1. **Name the machines** (optional). Each machine is known by its hostname.
+   To pick a name, put `machine_id = "desktop"` in the repo's
+   `.git/gitsync.toml`. Use the same name in every repo on that machine.
+
+2. **Pair them, once.** On the desktop, in the repo:
+
+   ```
+   $ gitsync pair
+   pairing code: 482-913
+   on the other machine, in the repo, run:
+     gitsync pair 482-913
+   ```
+
+   Within 2 minutes, on the laptop, in the repo:
+
+   ```
+   $ gitsync pair 482-913
+   paired with desktop
+   ```
+
+   They find each other on the LAN by themselves. Where multicast is
+   blocked, add the `--host` the desktop printed. A mistyped code just
+   ends the attempt: run `gitsync pair` again.
+
+3. **Start syncing.** On both machines, in the repo:
+
+   ```
+   gitsync service install
+   ```
+
+   It runs in the background from now on, also after a restart. On
+   Windows, it also prints a firewall command to run once as
+   administrator, so the other machine can connect.
+
+4. **Try it.** Edit a file on the desktop and save it: within a few
+   seconds the change is on the laptop, without committing anything.
+   `gitsync status` shows each peer and whether it is in sync;
+   `gitsync discover` lists the machines it hears and whether they are
+   paired.
+
+5. **If both change the same lines** before they sync, nothing is
+   overwritten: `gitsync resolve` lists the files, and
+   `gitsync resolve --take desktop` or `gitsync resolve --keep-mine`
+   settles it.
+
+For a third machine, pair it with each of the others once. To sync over
+ssh instead, set `transport = "ssh"` in `.git/gitsync.toml` (DESIGN.md,
+sections 4 and 5).
+
 ## Download
 
 Ready-made programs for Linux (x86-64 and ARM64, e.g. a Raspberry Pi),
 Windows and macOS (Intel and Apple Silicon) are on the
 [Releases page](https://github.com/Rafhack/GitSync/releases). Unpack it and put
 `gitsync` (`gitsync.exe` on Windows) somewhere on your `PATH`. Every machine
-also needs `git` and an ssh server (DESIGN.md, section 5).
+also needs `git` (and an ssh server only with `transport = "ssh"`).
 
 ## Try it
 
 1. Install Rust: https://rustup.rs (one installer, works on Windows, macOS, Linux).
-   Or skip building and use a download (above).
+   Or skip building and use a download (above). Building needs a C compiler
+   too (for `ring`, the TLS crypto library); cross-builds for musl use
+   `CC_<target>=clang`.
 2. Build: `cargo build --release` (the program ends up in `target/release/gitsync`).
 3. Run the tests: `cargo test`.
 4. In any git repo: `gitsync watch` (Ctrl+C to stop), edit a file, then look at
@@ -66,7 +131,7 @@ also needs `git` and an ssh server (DESIGN.md, section 5).
 ## Code map
 
 - `src/main.rs`: command line (`snapshot`, `watch`, `status`, `fetch`, `apply`, `resolve`,
-  `discover`, `service`).
+  `discover`, `service`, `id`, `pair`, `unpair`, `trust`).
 - `src/lib.rs`: lists the modules below (so tests can use them).
 - `src/git.rs`: small wrapper that runs the `git` program.
 - `src/snapshot.rs`: turns uncommitted work into a snapshot commit.
@@ -79,6 +144,13 @@ also needs `git` and an ssh server (DESIGN.md, section 5).
 - `src/log_file.rs`: the size-capped log file for `watch --log-file`.
 - `src/discovery.rs`: mDNS announcements and finding peers on the LAN.
 - `src/fetch.rs`: fetches a peer's branches and snapshots.
+- `src/identity.rs`: this machine's key and fingerprint (gitsync transport).
+- `src/trust.rs`: the paired machines (`trusted_peers.toml`).
+- `src/pair.rs`: `gitsync pair`, trusting a machine by a short code (SPAKE2).
+- `src/tls.rs`: TLS with pinned keys, and copying bytes both ways.
+- `src/serve.rs`: the listener in `watch` that runs `git upload-pack` for
+  paired machines.
+- `src/connect.rs`: `gitsync connect`, what `git fetch` runs to reach them.
 - `src/apply.rs`: decides whether a peer's work is newer, applies or merges
   it, and settles conflicts.
 - `src/config.rs`: reads and checks `.git/gitsync.toml`.

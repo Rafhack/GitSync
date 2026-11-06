@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{clone_of, repo, write};
 use gitsync::config::Config;
-use gitsync::discovery::{Announcement, Found, Mdns, PeerEvent};
+use gitsync::discovery::{Announcement, Found, Mdns, PeerEvent, Reach};
 use gitsync::snapshot::snapshot;
 
 /// Waits for the first event matching `want`, skipping others.
@@ -37,8 +37,12 @@ fn peers_find_each_other_and_see_news() {
     let (laptop_dir, laptop) = repo();
     let (desk_dir, desktop) = clone_of(laptop_dir.path());
     let config = Config::default();
+    let (ssh, port) = Reach::ssh(&desktop, &config).unwrap();
+    let Reach::Ssh { path, .. } = &ssh else {
+        unreachable!()
+    };
 
-    let laptop_ann = Announcement::for_repo(&laptop, "laptop", &config)
+    let laptop_ann = Announcement::for_repo(&laptop, "laptop", &ssh, port)
         .unwrap()
         .unwrap();
     let browser = Mdns::start().unwrap();
@@ -46,7 +50,7 @@ fn peers_find_each_other_and_see_news() {
 
     // The desktop announces itself.
     let desk_mdns = Mdns::start().unwrap();
-    let first = Announcement::for_repo(&desktop, "desktop", &config)
+    let first = Announcement::for_repo(&desktop, "desktop", &ssh, port)
         .unwrap()
         .unwrap();
     assert_eq!(first.repo, laptop_ann.repo, "clones share the repo id");
@@ -60,17 +64,16 @@ fn peers_find_each_other_and_see_news() {
     assert_eq!(seen.peer.name, "desktop");
     assert_eq!(seen.gen, first.gen);
     assert!(
-        seen.peer.url.ends_with(&first.path),
-        "{} should end with {}",
+        seen.peer.url.ends_with(path.as_str()),
+        "{} should end with {path}",
         seen.peer.url,
-        first.path
     );
     assert_eq!(seen.peer.host_key_alias.as_deref(), Some("gitsync-desktop"));
 
     // News on the desktop: a new snapshot changes its gen.
     write(desk_dir.path(), "a.txt", "changed\n");
     snapshot(&desktop, "desktop").unwrap();
-    let second = Announcement::for_repo(&desktop, "desktop", &config)
+    let second = Announcement::for_repo(&desktop, "desktop", &ssh, port)
         .unwrap()
         .unwrap();
     assert_ne!(second.gen, first.gen);
@@ -95,11 +98,11 @@ fn other_projects_are_not_reported() {
     write(b_dir.path(), "a.txt", "other project\n");
     b.run(&["commit", "-q", "--amend", "-am", "different root"])
         .unwrap();
-    let config = Config::default();
-    let a_ann = Announcement::for_repo(&a, "a-machine", &config)
+    let reach = Reach::Gitsync { key: "K".into() };
+    let a_ann = Announcement::for_repo(&a, "a-machine", &reach, 7431)
         .unwrap()
         .unwrap();
-    let b_ann = Announcement::for_repo(&b, "b-machine", &config)
+    let b_ann = Announcement::for_repo(&b, "b-machine", &reach, 7431)
         .unwrap()
         .unwrap();
     assert_ne!(a_ann.repo, b_ann.repo);
@@ -112,4 +115,31 @@ fn other_projects_are_not_reported() {
     std::thread::sleep(Duration::from_secs(3));
     let reported: Vec<_> = events.try_iter().collect();
     assert!(reported.is_empty(), "{reported:?}");
+}
+
+#[test]
+fn gitsync_transport_peers_announce_port_and_key() {
+    let (laptop_dir, laptop) = repo();
+    let (_desk_dir, desktop) = clone_of(laptop_dir.path());
+    let key = gitsync::identity::fingerprint(b"desktop key");
+    let reach = Reach::Gitsync { key: key.clone() };
+    let ours = Announcement::for_repo(&laptop, "laptop", &reach, 1)
+        .unwrap()
+        .unwrap();
+    let browser = Mdns::start().unwrap();
+    let events = browser.browse(&ours.repo, "laptop").unwrap();
+
+    let desk_mdns = Mdns::start().unwrap();
+    let theirs = Announcement::for_repo(&desktop, "gs-desktop", &reach, 41234)
+        .unwrap()
+        .unwrap();
+    desk_mdns.announce(&theirs).unwrap();
+
+    let seen = found(wait_for(
+        &events,
+        |e| matches!(e, PeerEvent::Found(f) if f.peer.name == "gs-desktop"),
+    ));
+    assert!(seen.peer.url.starts_with("gitsync://"), "{}", seen.peer.url);
+    assert!(seen.peer.url.ends_with(":41234"), "{}", seen.peer.url);
+    assert_eq!(seen.key_hint, Some(key));
 }

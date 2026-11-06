@@ -19,9 +19,10 @@ jobs:
       matrix:
         include:
           # Linux: static (musl) programs, so they run on any distribution.
-          # rust-lld links them without a C toolchain for the target.
-          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld }
+          # rust-lld links them without a C toolchain for the target; clang
+          # compiles ring's C code (TLS for the gitsync transport) for it.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld, cc: clang }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, linker: rust-lld, cc: clang }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-apple-darwin, os: macos-latest }
@@ -47,6 +48,9 @@ jobs:
           if [ -n "${{ matrix.linker }}" ]; then
             var="CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER"
             export "$var=${{ matrix.linker }}"
+          fi
+          if [ -n "${{ matrix.cc }}" ]; then
+            export "CC_$(echo '${{ matrix.target }}' | tr '-' '_')=${{ matrix.cc }}"
           fi
           cargo build --release --locked --target ${{ matrix.target }}
 

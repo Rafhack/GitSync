@@ -1,14 +1,16 @@
 //! Finding peers on the LAN with mDNS / DNS-SD (DESIGN.md §4).
 //!
 //! Every `gitsync watch` announces a `_gitsync._tcp.local.` service per repo,
-//! with TXT records saying who it is, which project, how to reach it over
-//! ssh, and a `gen` fingerprint that changes whenever it has something new.
+//! with TXT records saying who it is, which project, how to reach it (gitsync
+//! transport and its key, or ssh user and path), and a `gen` fingerprint that changes whenever it has something new.
 //! Peers browse for that service and fetch as soon as a `gen` changes.
 //!
 //! Announcements are untrusted input: anyone on the LAN can send them. They
-//! are only used to *find* a peer; the data itself always comes over ssh, and
-//! ssh checks the peer's host key under a fixed name (`gitsync-<peer>`), so a
-//! fake announcement can at most cause a failed connection.
+//! are only used to *find* a peer. The data comes over the gitsync transport,
+//! which checks the peer's key against the one paired under its name (§11),
+//! or over ssh, which checks the peer's host key under a fixed name
+//! (`gitsync-<peer>`). Either way a fake announcement can at most cause a
+//! failed connection.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -24,6 +26,7 @@ use tracing::{debug, warn};
 
 use crate::config::{Config, Peer};
 use crate::git::Git;
+use crate::identity::normalize;
 use crate::snapshot::validate_machine_id;
 
 pub const SERVICE_TYPE: &str = "_gitsync._tcp.local.";
@@ -34,20 +37,27 @@ pub struct Announcement {
     pub machine: String,
     /// The repo's first commit: only peers with the same project match.
     pub repo: String,
-    pub user: String,
-    pub path: String,
+    /// How peers fetch from us.
+    pub reach: Reach,
+    /// The ssh port, or the gitsync transport's listener port.
     pub port: u16,
     /// Changes whenever our branches or snapshot change.
     pub gen: String,
 }
 
-impl Announcement {
-    /// What to announce for this repo right now. `None` before the first
-    /// commit, since there is no repo id to match peers on yet.
-    pub fn for_repo(git: &Git, machine_id: &str, config: &Config) -> Result<Option<Self>> {
-        let Some(repo) = repo_id(git)? else {
-            return Ok(None);
-        };
+/// How peers fetch from this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    /// Over ssh, as `user` at `path`.
+    Ssh { user: String, path: String },
+    /// Over the gitsync transport; `key` is our fingerprint, a hint only
+    /// (trust comes from the TLS handshake against the trust list).
+    Gitsync { key: String },
+}
+
+impl Reach {
+    /// How peers reach this repo over ssh, and the ssh port.
+    pub fn ssh(git: &Git, config: &Config) -> Result<(Self, u16)> {
         let user = match &config.advertise.user {
             Some(user) => user.clone(),
             None => current_user()?,
@@ -62,12 +72,25 @@ impl Announcement {
         validate_path(&path).context(
             "peers could not use this repo's path; set [advertise] path in .git/gitsync.toml",
         )?;
+        Ok((
+            Self::Ssh { user, path },
+            config.advertise.port.unwrap_or(22),
+        ))
+    }
+}
+
+impl Announcement {
+    /// What to announce for this repo right now. `None` before the first
+    /// commit, since there is no repo id to match peers on yet.
+    pub fn for_repo(git: &Git, machine_id: &str, reach: &Reach, port: u16) -> Result<Option<Self>> {
+        let Some(repo) = repo_id(git)? else {
+            return Ok(None);
+        };
         Ok(Some(Self {
             machine: machine_id.to_string(),
             repo,
-            user,
-            path,
-            port: config.advertise.port.unwrap_or(22),
+            reach: reach.clone(),
+            port,
             gen: gen(git, machine_id)?,
         }))
     }
@@ -77,13 +100,23 @@ impl Announcement {
     }
 
     fn txt(&self) -> HashMap<String, String> {
-        HashMap::from([
+        let mut txt = HashMap::from([
             ("machine".into(), self.machine.clone()),
             ("repo".into(), self.repo.clone()),
-            ("user".into(), self.user.clone()),
-            ("path".into(), self.path.clone()),
             ("gen".into(), self.gen.clone()),
-        ])
+        ]);
+        match &self.reach {
+            Reach::Ssh { user, path } => {
+                txt.insert("transport".into(), "ssh".into());
+                txt.insert("user".into(), user.clone());
+                txt.insert("path".into(), path.clone());
+            }
+            Reach::Gitsync { key } => {
+                txt.insert("transport".into(), "gitsync".into());
+                txt.insert("key".into(), key.clone());
+            }
+        }
+        txt
     }
 }
 
@@ -92,6 +125,8 @@ impl Announcement {
 pub struct Found {
     pub peer: Peer,
     pub gen: String,
+    /// For gitsync transport peers: the key it says it has (a hint only).
+    pub key_hint: Option<String>,
     /// The mDNS instance name, to recognize its removal.
     pub fullname: String,
 }
@@ -121,22 +156,29 @@ pub fn parse(
             .map(String::as_str)
             .ok_or_else(|| Skip::Invalid(format!("no `{key}` in announcement")))
     };
-    let (machine, repo, user, path, gen) = (
-        field("machine")?,
-        field("repo")?,
-        field("user")?,
-        field("path")?,
-        field("gen")?,
-    );
+    let (machine, repo, gen) = (field("machine")?, field("repo")?, field("gen")?);
     if repo != our_repo || machine == our_machine {
         return Err(Skip::NotOurs);
     }
     validate_machine_id(machine).map_err(|e| Skip::Invalid(format!("{e:#}")))?;
-    validate_user(user).map_err(|e| Skip::Invalid(format!("{e:#}")))?;
-    validate_path(path).map_err(|e| Skip::Invalid(format!("{e:#}")))?;
     if gen.len() > 64 {
         return Err(Skip::Invalid("`gen` too long".into()));
     }
+    // Older gitsyncs announce no transport: they serve over ssh.
+    let gitsync = match txt.get("transport").map(String::as_str) {
+        None | Some("ssh") => false,
+        Some("gitsync") => true,
+        Some(other) => return Err(Skip::Invalid(format!("unknown transport {other:?}"))),
+    };
+    let key_hint = if gitsync {
+        let key = field("key")?;
+        let key = normalize(key).map_err(|e| Skip::Invalid(format!("{e:#}")))?;
+        Some(key)
+    } else {
+        validate_user(field("user")?).map_err(|e| Skip::Invalid(format!("{e:#}")))?;
+        validate_path(field("path")?).map_err(|e| Skip::Invalid(format!("{e:#}")))?;
+        None
+    };
     let Some(ip) = best_address(addresses) else {
         return Err(Skip::NoAddressYet);
     };
@@ -144,18 +186,24 @@ pub fn parse(
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => format!("[{v6}]"),
     };
-    let port = if port == 22 {
-        String::new()
+    let peer = if gitsync {
+        Peer::new(machine, format!("gitsync://{host}:{port}"))
     } else {
-        format!(":{port}")
+        let port = if port == 22 {
+            String::new()
+        } else {
+            format!(":{port}")
+        };
+        Peer {
+            name: machine.to_string(),
+            url: format!("ssh://{}@{host}{port}{}", field("user")?, field("path")?),
+            host_key_alias: Some(host_key_alias(machine)),
+        }
     };
     Ok(Found {
-        peer: Peer {
-            name: machine.to_string(),
-            url: format!("ssh://{user}@{host}{port}{path}"),
-            host_key_alias: Some(host_key_alias(machine)),
-        },
+        peer,
         gen: gen.to_string(),
+        key_hint,
         fullname: fullname.to_string(),
     })
 }
@@ -164,7 +212,7 @@ pub fn parse(
 /// preferred, but some networks drop the IPv4 half of mDNS answers (Wi-Fi
 /// power saving on laptops, for example), and the IPv6 address works too.
 pub fn ipv6_note(url: &str) -> &'static str {
-    if url.contains("@[") {
+    if url.contains("@[") || url.contains("//[") {
         " (IPv6: the IPv4 answer did not arrive; this address works too)"
     } else {
         ""
@@ -200,7 +248,7 @@ pub fn validate_path(path: &str) -> Result<()> {
 
 /// Prefers an IPv4 address, then a global IPv6 one; never loopback or
 /// link-local (those need extra scope information to be usable).
-fn best_address(addresses: &[IpAddr]) -> Option<IpAddr> {
+pub fn best_address(addresses: &[IpAddr]) -> Option<IpAddr> {
     let mut v4: Vec<_> = addresses
         .iter()
         .filter_map(|ip| match ip {
@@ -224,7 +272,7 @@ fn best_address(addresses: &[IpAddr]) -> Option<IpAddr> {
 
 /// The repo's root commit (the first, if several), or `None` before the
 /// first commit.
-fn repo_id(git: &Git) -> Result<Option<String>> {
+pub fn repo_id(git: &Git) -> Result<Option<String>> {
     if git
         .try_run(&["rev-parse", "--verify", "-q", "HEAD"])?
         .is_none()
@@ -290,6 +338,16 @@ fn windows_login(user: &str) -> String {
     user.rsplit('\\').next().unwrap_or(user).to_lowercase()
 }
 
+/// This machine's host name for mDNS records (`fedora.local.`).
+pub fn mdns_hostname() -> String {
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
+    let host: String = host
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("{}.local.", host.trim_matches('-'))
+}
+
 /// A peer appearing, changing, or leaving the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerEvent {
@@ -307,14 +365,9 @@ pub struct Mdns {
 impl Mdns {
     pub fn start() -> Result<Self> {
         let daemon = ServiceDaemon::new().context("starting mDNS")?;
-        let host = gethostname::gethostname().to_string_lossy().into_owned();
-        let host: String = host
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
         Ok(Self {
             daemon,
-            hostname: format!("{}.local.", host.trim_matches('-')),
+            hostname: mdns_hostname(),
             current: Mutex::new(None),
         })
     }
@@ -526,6 +579,84 @@ mod tests {
             ("path".into(), "/c/Users/rafael/My Repos/demo".into()),
             ("gen".into(), "1".into()),
         ])
+    }
+
+    fn gitsync_txt(machine: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("machine".into(), machine.into()),
+            ("repo".into(), "abc".into()),
+            ("gen".into(), "1".into()),
+            ("transport".into(), "gitsync".into()),
+            ("key".into(), crate::identity::fingerprint(b"k")),
+        ])
+    }
+
+    #[test]
+    fn builds_gitsync_url_from_announcement() {
+        let found = parse(
+            &gitsync_txt("pi"),
+            &ips(&["10.0.0.9"]),
+            41234,
+            "f",
+            "abc",
+            "me",
+        )
+        .unwrap();
+        assert_eq!(found.peer.url, "gitsync://10.0.0.9:41234");
+        assert_eq!(found.peer.host_key_alias, None);
+        assert_eq!(found.key_hint, Some(crate::identity::fingerprint(b"k")));
+        let v6 = parse(
+            &gitsync_txt("pi"),
+            &ips(&["2001:db8::5"]),
+            7,
+            "f",
+            "abc",
+            "me",
+        )
+        .unwrap();
+        assert_eq!(v6.peer.url, "gitsync://[2001:db8::5]:7");
+        assert!(ipv6_note(&v6.peer.url).contains("IPv6"));
+
+        let ip = ips(&["10.0.0.9"]);
+        for (key, val) in [("key", "nope"), ("transport", "smoke-signals")] {
+            let mut t = gitsync_txt("pi");
+            t.insert(key.into(), val.into());
+            assert!(
+                matches!(parse(&t, &ip, 1, "f", "abc", "me"), Err(Skip::Invalid(_))),
+                "{key}"
+            );
+        }
+        let mut no_key = gitsync_txt("pi");
+        no_key.remove("key");
+        assert!(matches!(
+            parse(&no_key, &ip, 1, "f", "abc", "me"),
+            Err(Skip::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn announces_by_transport() {
+        let mut a = Announcement {
+            machine: "laptop".into(),
+            repo: "abc".into(),
+            reach: Reach::Gitsync { key: "K".into() },
+            port: 7431,
+            gen: "1".into(),
+        };
+        let txt = a.txt();
+        assert_eq!(txt["transport"], "gitsync");
+        assert_eq!(txt["key"], "K");
+        // The repo's location is not broadcast.
+        assert!(!txt.contains_key("path") && !txt.contains_key("user"));
+        a.reach = Reach::Ssh {
+            user: "me".into(),
+            path: "/r".into(),
+        };
+        let txt = a.txt();
+        assert_eq!(
+            (txt["transport"].as_str(), txt["path"].as_str()),
+            ("ssh", "/r")
+        );
     }
 
     fn ips(list: &[&str]) -> Vec<IpAddr> {
